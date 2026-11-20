@@ -37,6 +37,8 @@ using namespace vr;
 #endif
 
 ohmd_context* ctx;
+// rotation-only devices report position 0; lift the tracking origin so the head is not at floor level
+float g_flHeadHeight = 1.6f;
 
 class COpenHMDDeviceDriverController;
 
@@ -400,6 +402,7 @@ public:
 		pose.vecDriverFromHeadTranslation[i] = 0.0;
 		pose.vecWorldFromDriverTranslation[i] = 0.0;
 	}
+	pose.vecWorldFromDriverTranslation[1] = g_flHeadHeight;
 
 	if (m_is_oculus) {
 		const HmdQuaternion_t oculusOffsetQ  = { 0.966, 0.259, 0, 0};
@@ -548,8 +551,13 @@ public:
             }
         }
 
-        m_nWindowX = 1920; //TODO: real window offset
-        m_nWindowY = 0;
+        // windowX/windowY: desktop position of the HMD panel in extended mode
+        vr::EVRSettingsError serr = vr::VRSettingsError_None;
+        m_nWindowX = vr::VRSettings()->GetInt32( k_pch_Sample_Section, "windowX", &serr );
+        if (serr != vr::VRSettingsError_None) m_nWindowX = 1920;
+        serr = vr::VRSettingsError_None;
+        m_nWindowY = vr::VRSettings()->GetInt32( k_pch_Sample_Section, "windowY", &serr );
+        if (serr != vr::VRSettingsError_None) m_nWindowY = 0;
         ohmd_device_geti(hmd, OHMD_SCREEN_HORIZONTAL_RESOLUTION, &m_nWindowWidth);
         ohmd_device_geti(hmd, OHMD_SCREEN_VERTICAL_RESOLUTION, &m_nWindowHeight );
         ohmd_device_geti(hmd, OHMD_SCREEN_HORIZONTAL_RESOLUTION, &m_nRenderWidth);
@@ -574,6 +582,30 @@ public:
         ohmd_device_getf(hmd, OHMD_UNIVERSAL_DISTORTION_K, &(distortion_coeffs[0]));
         DriverLog("driver_openhmd: Distortion values a=%f b=%f c=%f d=%f\n", distortion_coeffs[0], distortion_coeffs[1], distortion_coeffs[2], distortion_coeffs[3]);
 
+#if defined( _WINDOWS )
+        // The CV1 panel only appears as a desktop display once the HMD is opened; the compositor
+        // fails with InvalidOutputDesktop if it starts before Windows has attached it.
+        bool found = false;
+        for (int tries = 0; tries < 60 && !found; tries++) {
+            DISPLAY_DEVICEA dd = { sizeof(dd) };
+            for (DWORD i = 0; EnumDisplayDevicesA(NULL, i, &dd, 0); i++, dd.cb = sizeof(dd)) {
+                DEVMODEA dm = {};
+                dm.dmSize = sizeof(dm);
+                if ((dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) &&
+                    EnumDisplaySettingsA(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm) &&
+                    dm.dmPosition.x == m_nWindowX && dm.dmPosition.y == m_nWindowY &&
+                    (int32_t)dm.dmPelsWidth == m_nWindowWidth && (int32_t)dm.dmPelsHeight == m_nWindowHeight) {
+                    DriverLog("driver_openhmd: HMD display %s attached at %d Hz after %d ms\n", dd.DeviceName, (int)dm.dmDisplayFrequency, tries * 250);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+                std::this_thread::sleep_for( std::chrono::milliseconds(250) );
+        }
+        if (!found)
+            DriverLog("driver_openhmd: no %dx%d display at %d,%d after 15 s; check windowX/windowY\n", m_nWindowWidth, m_nWindowHeight, m_nWindowX, m_nWindowY);
+#endif
 	/* Sleep for 1 second while activating to let the display connect */
 	std::this_thread::sleep_for( std::chrono::seconds(1) );
     }
@@ -728,7 +760,7 @@ public:
         sinPitch = -colMatrix[2][0];
         cosPitch = sqrt(1 - sinPitch*sinPitch);
 
-        if ( abs(cosPitch) > 0.1) 
+        if ( fabs(cosPitch) > 0.1) 
         {
             sinRoll = colMatrix[2][1] / cosPitch;
             cosRoll = colMatrix[2][2] / cosPitch;
@@ -837,8 +869,8 @@ public:
         float m12 = ohmdprojection.arr[f2(1,2)];
         float m02 = ohmdprojection.arr[f2(0,2)];
 
-        float near   = m23/(m22-1);
-        float far    = m23/(m22+1);
+        float zNear  = m23/(m22-1);
+        float zFar   = m23/(m22+1);
         *pfBottom = -   (m12-1)/m11;
         *pfTop    = -   (m12+1)/m11;
         *pfLeft   =     (m02-1)/m00;
@@ -853,7 +885,7 @@ public:
             ohmdprojection.arr[12], ohmdprojection.arr[13], ohmdprojection.arr[14], ohmdprojection.arr[15]
         );
         
-        DriverLog("projectionraw values lrtb, near far: %f %f %f %f | %f %f\n", *pfLeft, *pfRight, *pfTop, *pfBottom, near, far);
+        DriverLog("projectionraw values lrtb, near far: %f %f %f %f | %f %f\n", *pfLeft, *pfRight, *pfTop, *pfBottom, zNear, zFar);
         
         //DriverLog("angles %f %f %f\n", yaw, pitch, roll);
     }
@@ -984,6 +1016,7 @@ public:
 
         pose.qWorldFromDriverRotation = identityquat;
         pose.qDriverFromHeadRotation = identityquat;
+        pose.vecWorldFromDriverTranslation[1] = g_flHeadHeight;
 
         return pose;
     }
@@ -1059,6 +1092,12 @@ EVRInitError CServerDriver_OpenHMD::Init( vr::IVRDriverContext *pDriverContext )
 {
     VR_INIT_SERVER_DRIVER_CONTEXT( pDriverContext );
     InitDriverLog( vr::VRDriverLog() );
+
+    vr::EVRSettingsError herr = vr::VRSettingsError_None;
+    float head_height = vr::VRSettings()->GetFloat( k_pch_Sample_Section, "headHeight", &herr );
+    if (herr == vr::VRSettingsError_None)
+        g_flHeadHeight = head_height;
+    DriverLog("driver_openhmd: head height %f\n", g_flHeadHeight);
 
     ctx = ohmd_ctx_create();
     int num_devices = ohmd_ctx_probe(ctx);

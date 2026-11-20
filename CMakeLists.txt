@@ -8,9 +8,22 @@ set (CMAKE_CXX_STANDARD 11)
 file(COPY driver.vrdrivermanifest DESTINATION ${CMAKE_BINARY_DIR})
 file(COPY resources DESTINATION ${CMAKE_BINARY_DIR})
 
-include_directories("${CMAKE_SOURCE_DIR}/subprojects/openhmd/include")
-set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/subprojects/openhmd/cmake/")
-add_subdirectory(./subprojects/openhmd)
+# Optionally link a prebuilt static OpenHMD (and its hidapi import lib) instead of building the submodule
+set(OPENHMD_PREBUILT_LIB "" CACHE FILEPATH "Prebuilt static openhmd library")
+set(OPENHMD_PREBUILT_INCLUDE "" CACHE PATH "Include dir for the prebuilt openhmd")
+set(OPENHMD_PREBUILT_DEPS "" CACHE STRING "Extra libraries the prebuilt openhmd needs")
+if(OPENHMD_PREBUILT_LIB)
+  add_library(openhmd STATIC IMPORTED)
+  set_target_properties(openhmd PROPERTIES
+    IMPORTED_LOCATION "${OPENHMD_PREBUILT_LIB}"
+    INTERFACE_INCLUDE_DIRECTORIES "${OPENHMD_PREBUILT_INCLUDE}"
+    INTERFACE_COMPILE_DEFINITIONS OHMD_STATIC
+    INTERFACE_LINK_LIBRARIES "${OPENHMD_PREBUILT_DEPS}")
+else()
+  include_directories("${CMAKE_SOURCE_DIR}/subprojects/openhmd/include")
+  set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/subprojects/openhmd/cmake/")
+  add_subdirectory(./subprojects/openhmd)
+endif()
 
 include_directories("${CMAKE_SOURCE_DIR}/subprojects/openvr/")
 
@@ -21,7 +34,8 @@ add_library(driver_openhmd SHARED
 )
 
 if(MSVC)
-  target_compile_options(driver_openhmd PRIVATE /W4 /WX)
+  target_compile_options(driver_openhmd PRIVATE /W3)
+  target_compile_definitions(driver_openhmd PRIVATE _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
 else(MSVC)
   target_compile_options(driver_openhmd PRIVATE -Wall) #-Wextra -Wno-unused-parameter) #-pedantic)
 endif(MSVC)
@@ -53,8 +67,10 @@ elseif(NOT ANDROID)
   endif()
 endif()
 MESSAGE("SteamVR plugin path: ${PLUGINDIR}")
-set_target_properties(driver_openhmd PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${PLUGINDIR}")
+set_target_properties(driver_openhmd PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${PLUGINDIR}" RUNTIME_OUTPUT_DIRECTORY "${PLUGINDIR}")
 
 SET_TARGET_PROPERTIES(driver_openhmd PROPERTIES PREFIX "") # don't add lib prefix to driver_openhmd.so
 
-add_dependencies(driver_openhmd openhmd)
+if(NOT OPENHMD_PREBUILT_LIB)
+  add_dependencies(driver_openhmd openhmd)
+endif()
