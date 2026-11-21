@@ -379,7 +379,7 @@ HmdQuaternion_t identityquat{ 1, 0, 0, 0};
 // riftd Touch grip offset, right controller frame (+x right, +y up, -z forward); the left controller mirrors
 // x, yaw and roll. Defaults fit riftd's Touch LED model onto SteamVR's oculus_cv1_controller render model.
 struct TouchOffset { double t[3]; double pitch, yaw, roll; };
-static TouchOffset g_touchOffset = { { 0.007, 0.036, -0.038 }, 39.4, 0, 0 };
+static TouchOffset g_touchOffset = { { 0.007, 0.031, -0.07 }, 39.4, 0, 0 };
 
 static float SettingFloat(const char *key, float def, float limit)
 {
@@ -392,8 +392,8 @@ static void ReadTouchOffset()
 {
     TouchOffset o;
     o.t[0] = SettingFloat("touchOffsetX", 0.007f, 0.5f);
-    o.t[1] = SettingFloat("touchOffsetY", 0.036f, 0.5f);
-    o.t[2] = SettingFloat("touchOffsetZ", -0.038f, 0.5f);
+    o.t[1] = SettingFloat("touchOffsetY", 0.031f, 0.5f);
+    o.t[2] = SettingFloat("touchOffsetZ", -0.07f, 0.5f);
     o.pitch = SettingFloat("touchPitch", 39.4f, 360.0f);
     o.yaw = SettingFloat("touchYaw", 0.0f, 360.0f);
     o.roll = SettingFloat("touchRoll", 0.0f, 360.0f);
