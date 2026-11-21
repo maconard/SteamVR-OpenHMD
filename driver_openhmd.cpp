@@ -16,6 +16,10 @@
 
 #if defined( _WINDOWS )
 #include <windows.h>
+#include <mmdeviceapi.h>
+#include <initguid.h>
+#include <functiondiscoverykeys_devpkey.h>
+#pragma comment(lib, "ole32.lib")
 #endif
 
 #include <openhmd.h>
@@ -256,6 +260,48 @@ static int64_t QpcFreq()
     return 1;
 #endif
 }
+
+#if defined( _WINDOWS )
+// Endpoint ID of the first active audio endpoint whose name contains name, "" if none
+static std::string FindAudioEndpoint(EDataFlow flow, const wchar_t *name)
+{
+    std::string id;
+    HRESULT co = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    IMMDeviceEnumerator *en = NULL;
+    IMMDeviceCollection *all = NULL;
+    UINT n = 0;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void **)&en)) &&
+        SUCCEEDED(en->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, &all)) && SUCCEEDED(all->GetCount(&n))) {
+        for (UINT i = 0; i < n && id.empty(); i++) {
+            IMMDevice *dev = NULL;
+            IPropertyStore *props = NULL;
+            PROPVARIANT v;
+            PropVariantInit(&v);
+            if (SUCCEEDED(all->Item(i, &dev)) && SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &props)) &&
+                SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &v)) && v.vt == VT_LPWSTR && wcsstr(v.pwszVal, name)) {
+                LPWSTR wid = NULL;
+                char buf[512];
+                if (SUCCEEDED(dev->GetId(&wid)) && WideCharToMultiByte(CP_UTF8, 0, wid, -1, buf, sizeof(buf), NULL, NULL) > 0)
+                    id = buf;
+                CoTaskMemFree(wid);
+            }
+            PropVariantClear(&v);
+            if (props)
+                props->Release();
+            if (dev)
+                dev->Release();
+        }
+    }
+    if (all)
+        all->Release();
+    if (en)
+        en->Release();
+    // RPC_E_CHANGED_MODE: the thread already has COM, in another apartment, and keeps it
+    if (SUCCEEDED(co))
+        CoUninitialize();
+    return id;
+}
+#endif
 
 // Driver Init must return well within vrserver's watchdog (about 20 s) or SteamVR enters safe mode;
 // waits for riftd and for the HMD display end at this deadline.
@@ -1155,6 +1201,16 @@ public:
         vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_ModelNumber_String, m_sModelNumber.c_str() );
         if (m_oculusIdentity)
             vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_TrackingSystemName_String, "oculus" );
+#if defined( _WINDOWS )
+        if (m_cv1) {
+            std::string out = FindAudioEndpoint(eRender, L"Rift Audio"), in = FindAudioEndpoint(eCapture, L"Rift Audio");
+            DriverLog("driver_openhmd: Rift Audio playback %s, recording %s\n", out.empty() ? "not found" : out.c_str(), in.empty() ? "not found" : in.c_str());
+            if (!out.empty())
+                vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_Audio_DefaultPlaybackDeviceId_String, out.c_str() );
+            if (!in.empty())
+                vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_Audio_DefaultRecordingDeviceId_String, in.c_str() );
+        }
+#endif
         m_flIPD = DesiredIpd();
         vr::VRProperties()->SetFloatProperty( m_ulPropertyContainer, Prop_UserIpdMeters_Float, m_flIPD );
         vr::VRProperties()->SetFloatProperty( m_ulPropertyContainer, Prop_UserHeadToEyeDepthMeters_Float, 0.f );
