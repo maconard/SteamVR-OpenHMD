@@ -131,7 +131,8 @@ typedef struct riftd_room_request {
 
 /* Touch vibration requests, written by the driver, polled by riftd. Per controller (index
  * RIFTD_DEV_LEFT - 1, RIFTD_DEV_RIGHT - 1): increment seq to an odd value, write the fields,
- * increment it to an even value. riftd applies each new even seq; amplitude or duration 0 stops. */
+ * increment it to an even value. riftd applies each new even seq; amplitude 0 stops, duration 0 is
+ * one pulse (OpenVR's legacy TriggerHapticPulse). */
 #define RIFTD_HAPTIC_NAME "Local\\riftd-haptic"
 
 typedef struct riftd_haptic_pulse {
