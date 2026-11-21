@@ -15,7 +15,7 @@
 
 #define RIFTD_SHM_NAME "Local\\riftd-shm"
 #define RIFTD_SHM_MAGIC 0x44544652u /* "RFTD" */
-#define RIFTD_SHM_VERSION 1
+#define RIFTD_SHM_VERSION 2
 
 #define RIFTD_MAX_CONTROLS 16
 #define RIFTD_MAX_SENSORS 4
@@ -103,10 +103,27 @@ typedef struct riftd_shm {
 
 	uint32_t n_sensors;
 	riftd_sensor sensors[RIFTD_MAX_SENSORS];
+
+	/* Room offset as x, y, z (m) and yaw (rad), the transform from the stored sensor frame to the
+	 * published tracking space (rift-room-config.json). The tracker applies room_applied, the one
+	 * loaded at start; riftd applies the rest to the published poses. */
+	float room_offset[4];
+	float room_applied[4];
+	uint32_t room_seq;            /* last riftd_room_request.seq handled */
+	int32_t room_result;          /* 0 stored, -1 not stored */
 } riftd_shm;
 
+/* Room offset request, written by a client (riftsetup), polled by riftd: write offset, then
+ * increment seq. riftd stores it and reports room_seq and room_result. */
+#define RIFTD_ROOM_NAME "Local\\riftd-room"
+
+typedef struct riftd_room_request {
+	volatile uint32_t seq;
+	float offset[4];
+} riftd_room_request;
+
 #define RIFTD_SHM_ASSERT(name, cond) typedef char riftd_shm_assert_##name[(cond) ? 1 : -1]
-RIFTD_SHM_ASSERT(size, sizeof(riftd_shm) == 2088);
+RIFTD_SHM_ASSERT(size, sizeof(riftd_shm) == 2128);
 RIFTD_SHM_ASSERT(devices, offsetof(riftd_shm, devices) == 264);
 RIFTD_SHM_ASSERT(sensors, offsetof(riftd_shm, sensors) == 1924);
 
