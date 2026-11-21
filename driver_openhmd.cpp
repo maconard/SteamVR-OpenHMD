@@ -257,9 +257,34 @@ static void FillDeviceFromOpenHMD(int idx, ohmd_device *dev, riftd_device *d)
     memcpy(d->control_types, types, n * sizeof(int));
 }
 
-// Fills the tracking fields of pose from a riftd device. Returns true when it has an optical fix.
-static bool RiftdPose(const riftd_device &d, DriverPose_t &pose, bool is_hmd)
+// The compositor extrapolates every pose it renders, so one non-finite value reaches its view matrices.
+// Normalizes the rotation and drops implausible velocities; false if rotation or position is unusable.
+static bool SanitizePose(DriverPose_t &pose)
 {
+    HmdQuaternion_t &q = pose.qRotation;
+    double n = sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+    if (!(n > 0.5 && n < 2.0))
+        return false;
+    q.w /= n; q.x /= n; q.y /= n; q.z /= n;
+    bool vel_ok = true;
+    for (int i = 0; i < 3; i++) {
+        if (!isfinite(pose.vecPosition[i]))
+            return false;
+        vel_ok = vel_ok && fabs(pose.vecVelocity[i]) < 20.0 && fabs(pose.vecAngularVelocity[i]) < 60.0;
+    }
+    if (!vel_ok)
+        for (int i = 0; i < 3; i++)
+            pose.vecVelocity[i] = pose.vecAngularVelocity[i] = 0.0;
+    return true;
+}
+
+// Fills the tracking fields of pose from a riftd device. Returns true when it has an optical fix.
+static bool RiftdPose(int idx, DriverPose_t &pose)
+{
+    static DriverPose_t lastGood[RIFTD_NUM_DEVICES];
+    static bool haveGood[RIFTD_NUM_DEVICES];
+    const riftd_device d = SnapDevice(idx);
+    bool is_hmd = idx == RIFTD_DEV_HMD;
     bool valid = g_snapFresh && (d.flags & RIFTD_DEVICE_POSE_VALID);
     bool optical = valid && (d.flags & RIFTD_DEVICE_OPTICAL);
 
@@ -291,7 +316,28 @@ static bool RiftdPose(const riftd_device &d, DriverPose_t &pose, bool is_hmd)
     double age = g_riftdClient.SampleAge(d);
     pose.poseTimeOffset = age > 0.1 ? -0.1 : (age < 0 ? 0 : -age);
 #endif
-    return optical;
+    if (SanitizePose(pose)) {
+        lastGood[idx] = pose;
+        haveGood[idx] = true;
+        return optical;
+    }
+    static std::atomic<unsigned> bad(0);
+    if (bad++ % 1000 == 0)
+        DriverLog("driver_openhmd: device %d non-finite pose from riftd, holding last good pose (%u)\n", idx, bad.load());
+    bool connected = pose.deviceIsConnected;
+    if (haveGood[idx])
+        pose = lastGood[idx];
+    else {
+        pose.qRotation = { 1, 0, 0, 0 };
+        for (int i = 0; i < 3; i++)
+            pose.vecPosition[i] = 0.0;
+    }
+    for (int i = 0; i < 3; i++)
+        pose.vecVelocity[i] = pose.vecAngularVelocity[i] = 0.0;
+    pose.deviceIsConnected = connected;
+    pose.poseIsValid = haveGood[idx];
+    pose.result = haveGood[idx] && is_hmd ? TrackingResult_Running_OK : TrackingResult_Running_OutOfRange;
+    return false;
 }
 
 class COpenHMDDeviceDriverController;
@@ -335,26 +381,28 @@ HmdQuaternion_t identityquat{ 1, 0, 0, 0};
 struct TouchOffset { double t[3]; double pitch, yaw, roll; };
 static TouchOffset g_touchOffset = { { 0.007, 0.036, -0.038 }, 39.4, 0, 0 };
 
-static float SettingFloat(const char *key, float def)
+static float SettingFloat(const char *key, float def, float limit)
 {
     vr::EVRSettingsError err = vr::VRSettingsError_None;
     float v = vr::VRSettings()->GetFloat(k_pch_Sample_Section, key, &err);
-    return err == vr::VRSettingsError_None ? v : def;
+    return err == vr::VRSettingsError_None && fabsf(v) <= limit ? v : def;
 }
 
 static void ReadTouchOffset()
 {
     TouchOffset o;
-    o.t[0] = SettingFloat("touchOffsetX", 0.007f);
-    o.t[1] = SettingFloat("touchOffsetY", 0.036f);
-    o.t[2] = SettingFloat("touchOffsetZ", -0.038f);
-    o.pitch = SettingFloat("touchPitch", 39.4f);
-    o.yaw = SettingFloat("touchYaw", 0.0f);
-    o.roll = SettingFloat("touchRoll", 0.0f);
+    o.t[0] = SettingFloat("touchOffsetX", 0.007f, 0.5f);
+    o.t[1] = SettingFloat("touchOffsetY", 0.036f, 0.5f);
+    o.t[2] = SettingFloat("touchOffsetZ", -0.038f, 0.5f);
+    o.pitch = SettingFloat("touchPitch", 39.4f, 360.0f);
+    o.yaw = SettingFloat("touchYaw", 0.0f, 360.0f);
+    o.roll = SettingFloat("touchRoll", 0.0f, 360.0f);
     if (memcmp(&o, &g_touchOffset, sizeof(o)) != 0)
         DriverLog("driver_openhmd: touch offset %.3f %.3f %.3f m, pitch %.1f yaw %.1f roll %.1f deg\n",
                   o.t[0], o.t[1], o.t[2], o.pitch, o.yaw, o.roll);
+    AcquireSRWLockExclusive(&g_snapLock);
     g_touchOffset = o;
+    ReleaseSRWLockExclusive(&g_snapLock);
 }
 
 static HmdQuaternion_t AxisAngle(double x, double y, double z, double deg)
@@ -686,7 +734,7 @@ public:
     DriverPose_t GetPose()
     {
 	if (g_riftd) {
-		if (RiftdPose(SnapDevice(device_idx), pose, false))
+		if (RiftdPose(device_idx, pose))
 			m_hadOptical = true;
 		// until the cameras have seen it, hold the controller at the rotation-only default spot
 		if (!m_hadOptical)
@@ -734,7 +782,9 @@ public:
 		pose.vecDriverFromHeadTranslation[2] = 0.08;
 	}
 	else if (m_is_oculus) {
+		AcquireSRWLockShared(&g_snapLock);
 		const TouchOffset o = g_touchOffset;
+		ReleaseSRWLockShared(&g_snapLock);
 		double m = device_idx == RIFTD_DEV_LEFT ? -1 : 1;
 		pose.qDriverFromHeadRotation = QMul(QMul(AxisAngle(0, 1, 0, m * o.yaw), AxisAngle(1, 0, 0, o.pitch)), AxisAngle(0, 0, 1, m * o.roll));
 		pose.qWorldFromDriverRotation = identityquat;
@@ -1329,7 +1379,7 @@ public:
     {
         DriverPose_t pose = { 0 };
         if (g_riftd) {
-            if (RiftdPose(SnapDevice(RIFTD_DEV_HMD), pose, true))
+            if (RiftdPose(RIFTD_DEV_HMD, pose))
                 m_hadOptical = true;
             pose.qWorldFromDriverRotation = identityquat;
             pose.qDriverFromHeadRotation = identityquat;
