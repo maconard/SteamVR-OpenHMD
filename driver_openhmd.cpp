@@ -329,6 +329,47 @@ static const char * const k_pch_Sample_SecondsFromVsyncToPhotons_Float = "second
 static const char * const k_pch_Sample_DisplayFrequency_Float = "displayFrequency";
 
 HmdQuaternion_t identityquat{ 1, 0, 0, 0};
+
+// riftd Touch grip offset, right controller frame (+x right, +y up, -z forward); the left controller mirrors
+// x, yaw and roll. Defaults fit riftd's Touch LED model onto SteamVR's oculus_cv1_controller render model.
+struct TouchOffset { double t[3]; double pitch, yaw, roll; };
+static TouchOffset g_touchOffset = { { 0.007, 0.036, -0.038 }, 39.4, 0, 0 };
+
+static float SettingFloat(const char *key, float def)
+{
+    vr::EVRSettingsError err = vr::VRSettingsError_None;
+    float v = vr::VRSettings()->GetFloat(k_pch_Sample_Section, key, &err);
+    return err == vr::VRSettingsError_None ? v : def;
+}
+
+static void ReadTouchOffset()
+{
+    TouchOffset o;
+    o.t[0] = SettingFloat("touchOffsetX", 0.007f);
+    o.t[1] = SettingFloat("touchOffsetY", 0.036f);
+    o.t[2] = SettingFloat("touchOffsetZ", -0.038f);
+    o.pitch = SettingFloat("touchPitch", 39.4f);
+    o.yaw = SettingFloat("touchYaw", 0.0f);
+    o.roll = SettingFloat("touchRoll", 0.0f);
+    if (memcmp(&o, &g_touchOffset, sizeof(o)) != 0)
+        DriverLog("driver_openhmd: touch offset %.3f %.3f %.3f m, pitch %.1f yaw %.1f roll %.1f deg\n",
+                  o.t[0], o.t[1], o.t[2], o.pitch, o.yaw, o.roll);
+    g_touchOffset = o;
+}
+
+static HmdQuaternion_t AxisAngle(double x, double y, double z, double deg)
+{
+    double h = deg * M_PI / 360, s = sin(h);
+    return { cos(h), x * s, y * s, z * s };
+}
+
+static HmdQuaternion_t QMul(const HmdQuaternion_t &a, const HmdQuaternion_t &b)
+{
+    return { a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+             a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+             a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+             a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w };
+}
 //-----------------------------------------------------------------------------
 // Purpose:
 //-----------------------------------------------------------------------------
@@ -682,8 +723,8 @@ public:
 	}
 	pose.vecWorldFromDriverTranslation[1] = (g_riftd && m_hadOptical) ? 0.0 : g_flHeadHeight;
 
-	// riftd reports Touch in its calibration (LED model) frame, which Monado also passes on as the grip
-	// pose without an offset; this offset only suits upstream OpenHMD's 3DoF Touch rotation.
+	// This fixed offset only suits upstream OpenHMD's 3DoF Touch rotation; riftd reports the Touch LED
+	// model frame and takes the tunable g_touchOffset.
 	if (m_is_oculus && !g_riftd) {
 		const HmdQuaternion_t oculusOffsetQ  = { 0.966, 0.259, 0, 0};
 
@@ -691,6 +732,15 @@ public:
 		pose.qWorldFromDriverRotation = identityquat;
 
 		pose.vecDriverFromHeadTranslation[2] = 0.08;
+	}
+	else if (m_is_oculus) {
+		const TouchOffset o = g_touchOffset;
+		double m = device_idx == RIFTD_DEV_LEFT ? -1 : 1;
+		pose.qDriverFromHeadRotation = QMul(QMul(AxisAngle(0, 1, 0, m * o.yaw), AxisAngle(1, 0, 0, o.pitch)), AxisAngle(0, 0, 1, m * o.roll));
+		pose.qWorldFromDriverRotation = identityquat;
+		pose.vecDriverFromHeadTranslation[0] = m * o.t[0];
+		pose.vecDriverFromHeadTranslation[1] = o.t[1];
+		pose.vecDriverFromHeadTranslation[2] = o.t[2];
 	}
 	else {
 		pose.qDriverFromHeadRotation = identityquat;
@@ -1399,6 +1449,7 @@ EVRInitError CServerDriver_OpenHMD::Init( vr::IVRDriverContext *pDriverContext )
     if (herr == vr::VRSettingsError_None)
         g_flHeadHeight = head_height;
     DriverLog("driver_openhmd: head height %f\n", g_flHeadHeight);
+    ReadTouchOffset();
 
     char backend[64] = "";
     herr = vr::VRSettingsError_None;
@@ -1538,7 +1589,13 @@ void CServerDriver_OpenHMD::RunFrame()
 #if defined( _WINDOWS )
     if (g_riftd) {
         static bool cached = false;
+        static int64_t lastSettings = 0;
         bool fresh = g_riftdClient.Update();
+        // drivers get no settings-changed event; polling lets vrset changes apply live
+        if (QpcNow() - lastSettings > g_riftdClient.Freq()) {
+            ReadTouchOffset();
+            lastSettings = QpcNow();
+        }
         if (fresh != g_snapFresh)
             DriverLog("driver_openhmd: riftd %s\n", fresh ? "updating" : "stopped updating; devices marked invalid");
         if (fresh && !cached) {
