@@ -1108,6 +1108,18 @@ public:
             "\"seated\":{\"translation\":[0,0,0],\"yaw\":0},\"standing\":{\"translation\":[0,0,0],\"yaw\":0}}]}" );
         vr::VRProperties()->SetBoolProperty( m_ulPropertyContainer, Prop_DriverProvidedChaperoneVisibility_Bool, false );
 
+        if (g_riftd) {
+            // the stock oculus driver's CV1 profile declares /proximity
+            vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_ControllerType_String, "rift" );
+            vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_InputProfilePath_String, "{oculus}/input/rift_profile.json" );
+            AcquireSRWLockShared(&g_snapLock);
+            bool hasProximity = g_snap.proximity >= 0;
+            ReleaseSRWLockShared(&g_snapLock);
+            vr::VRProperties()->SetBoolProperty( m_ulPropertyContainer, Prop_ContainsProximitySensor_Bool, hasProximity );
+            if (hasProximity)
+                vr::VRDriverInput()->CreateBooleanComponent( m_ulPropertyContainer, "/proximity", &m_proximity );
+        }
+
         return VRInitError_None;
     }
 
@@ -1546,6 +1558,12 @@ public:
         {
             vr::VRServerDriverHost()->TrackedDevicePoseUpdated( m_unObjectId, GetPose(), sizeof( DriverPose_t ) );
         }
+        if (m_proximity != k_ulInvalidInputComponentHandle) {
+            AcquireSRWLockShared(&g_snapLock);
+            bool worn = g_snap.hmd_worn != 0;
+            ReleaseSRWLockShared(&g_snapLock);
+            vr::VRDriverInput()->UpdateBooleanComponent( m_proximity, worn, 0 );
+        }
     }
 
     std::string GetSerialNumber() const { return m_sSerialNumber; }
@@ -1556,6 +1574,7 @@ private:
     riftd_display m_display = {};
     bool m_hadOptical = false;
     bool m_cv1 = false;
+    vr::VRInputComponentHandle_t m_proximity = k_ulInvalidInputComponentHandle;
     Cv1Optics m_optics;
 
     vr::TrackedDeviceIndex_t m_unObjectId;
