@@ -246,6 +246,17 @@ static int64_t QpcNow()
 #endif
 }
 
+static int64_t QpcFreq()
+{
+#if defined( _WINDOWS )
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return f.QuadPart;
+#else
+    return 1;
+#endif
+}
+
 // Driver Init must return well within vrserver's watchdog (about 20 s) or SteamVR enters safe mode;
 // waits for riftd and for the HMD display end at this deadline.
 int64_t g_initDeadline = 0;
@@ -844,7 +855,10 @@ public:
 
         for (int i = 0; i < control_count; i++) {
           if (m_buttons[i] != k_ulInvalidInputComponentHandle) {
-            vr::VRDriverInput()->UpdateBooleanComponent( m_buttons[i], control_state[i] != 0, 0 );
+            bool pressed = control_state[i] != 0;
+            if (g_riftd && device_idx == RIFTD_DEV_RIGHT && m_info.control_hints[i] == OHMD_HOME)
+              pressed = HomeClick(pressed);
+            vr::VRDriverInput()->UpdateBooleanComponent( m_buttons[i], pressed, 0 );
           }
           else if (m_analogControls[i] != k_ulInvalidInputComponentHandle)
             vr::VRDriverInput()->UpdateScalarComponent( m_analogControls[i], control_state[i], 0 );
@@ -858,6 +872,20 @@ public:
             if (m_extraTouch[k] != k_ulInvalidInputComponentHandle)
               vr::VRDriverInput()->UpdateScalarComponent( m_extraTouch[k], touch_state[2 + k], 0 );
         }
+    }
+
+    // The right Oculus button reaches SteamVR for one frame on release, and not after a hold that
+    // made riftd recenter.
+    bool HomeClick(bool down)
+    {
+        int64_t now = QpcNow();
+        bool click = false;
+        if (down && !m_homeDown)
+            m_homeSince = now;
+        else if (!down && m_homeDown)
+            click = now - m_homeSince < (int64_t)(RIFTD_RECENTER_HOLD_S * QpcFreq());
+        m_homeDown = down;
+        return click;
     }
 
     VRControllerState_t controllerstate;
@@ -889,6 +917,8 @@ public:
     vr::VRInputComponentHandle_t m_haptic = k_ulInvalidInputComponentHandle;
 
 private:
+    bool m_homeDown = false;
+    int64_t m_homeSince = 0;
     std::string m_sSerialNumber = "Controller serial number " + std::to_string(index);
     std::string m_sModelNumber = "Controller model number " + std::to_string(index);
     vr::TrackedDeviceIndex_t m_unObjectId;

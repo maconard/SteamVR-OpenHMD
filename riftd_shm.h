@@ -19,6 +19,9 @@
 
 #define RIFTD_MAX_CONTROLS 16
 #define RIFTD_MAX_SENSORS 4
+/* Holding the right Touch Oculus button this long makes riftd set forward and center from the
+ * headset; the driver only sends shorter presses to SteamVR. */
+#define RIFTD_RECENTER_HOLD_S 1.0
 
 enum riftd_device_index {
 	RIFTD_DEV_HMD = 0,
