@@ -567,6 +567,15 @@ public:
             m_is_oculus = true;
             DriverLog("detected oculus controllers, using oculus input profile");
         }
+
+        // the stock oculus driver's names for CV1 Touch
+        m_cv1Touch = g_riftd && m_is_oculus && strstr(m_info.product, "CV1") != NULL;
+        if (m_cv1Touch) {
+            const char *side = device_idx == RIFTD_DEV_LEFT ? "Left" : "Right";
+            m_sModelNumber = std::string("Oculus Rift CV1 (") + side + " Controller)";
+            if (g_snap.hmd_serial[0])
+                m_sSerialNumber = std::string(g_snap.hmd_serial) + "_Controller_" + side;
+        }
     }
     virtual ~COpenHMDDeviceDriverController() {}
 
@@ -585,7 +594,12 @@ public:
 
 	device_flags = m_info.ohmd_flags;
 
-        vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_ModelNumber_String, controllerModel);
+        if (m_cv1Touch) {
+            vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_ModelNumber_String, m_sModelNumber.c_str() );
+            vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_ManufacturerName_String, "Oculus" );
+            vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_TrackingSystemName_String, "oculus" );
+        } else
+            vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_ModelNumber_String, controllerModel);
         //vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_RenderModelName_String, controllerModel);
 	//vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_ModelNumber_String, "1" );
         if (m_is_oculus) {
@@ -935,6 +949,7 @@ private:
     bool m_gripTouched = false;
     std::string m_sSerialNumber = "Controller serial number " + std::to_string(index);
     std::string m_sModelNumber = "Controller model number " + std::to_string(index);
+    bool m_cv1Touch = false;
     vr::TrackedDeviceIndex_t m_unObjectId;
     vr::PropertyContainerHandle_t m_ulPropertyContainer;
 
@@ -1000,6 +1015,13 @@ public:
 
         m_sSerialNumber = product + ": " + path;
         m_sModelNumber = "OpenHMD: " + product;
+        // the stock oculus driver's names for the CV1
+        m_oculusIdentity = g_riftd && product.find("CV1") != std::string::npos;
+        if (m_oculusIdentity) {
+            m_sModelNumber = "Oculus Rift CV1";
+            if (g_snap.hmd_serial[0])
+                m_sSerialNumber = g_snap.hmd_serial;
+        }
 
         // Important to pass vendor through. Gaze cursor is only available for "Oculus". So grab the first word.
         char const* vendor_override = getenv("OHMD_VENDOR_OVERRIDE");
@@ -1131,6 +1153,8 @@ public:
 
         vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, Prop_ManufacturerName_String, m_sVendor.c_str());
         vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_ModelNumber_String, m_sModelNumber.c_str() );
+        if (m_oculusIdentity)
+            vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_TrackingSystemName_String, "oculus" );
         m_flIPD = DesiredIpd();
         vr::VRProperties()->SetFloatProperty( m_ulPropertyContainer, Prop_UserIpdMeters_Float, m_flIPD );
         vr::VRProperties()->SetFloatProperty( m_ulPropertyContainer, Prop_UserHeadToEyeDepthMeters_Float, 0.f );
@@ -1618,6 +1642,7 @@ private:
     riftd_display m_display = {};
     bool m_hadOptical = false;
     bool m_cv1 = false;
+    bool m_oculusIdentity = false;
     vr::VRInputComponentHandle_t m_proximity = k_ulInvalidInputComponentHandle;
     Cv1Optics m_optics;
 

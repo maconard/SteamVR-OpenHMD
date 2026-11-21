@@ -15,7 +15,7 @@
 
 #define RIFTD_SHM_NAME "Local\\riftd-shm"
 #define RIFTD_SHM_MAGIC 0x44544652u /* "RFTD" */
-#define RIFTD_SHM_VERSION 3
+#define RIFTD_SHM_VERSION 4
 
 #define RIFTD_MAX_CONTROLS 16
 #define RIFTD_MAX_SENSORS 4
@@ -117,6 +117,7 @@ typedef struct riftd_shm {
 
 	int32_t proximity;            /* CV1 proximity sensor, raw; -1 without one */
 	uint32_t hmd_worn;            /* proximity over 3 */
+	char hmd_serial[32];          /* the headset's USB serial number, "" if unknown */
 } riftd_shm;
 
 /* Room offset request, written by a client (riftsetup), polled by riftd: write offset, then
@@ -146,7 +147,7 @@ typedef struct riftd_haptic_request {
 
 #define RIFTD_SHM_ASSERT(name, cond) typedef char riftd_shm_assert_##name[(cond) ? 1 : -1]
 RIFTD_SHM_ASSERT(haptic, sizeof(riftd_haptic_request) == 32);
-RIFTD_SHM_ASSERT(size, sizeof(riftd_shm) == 2136);
+RIFTD_SHM_ASSERT(size, sizeof(riftd_shm) == 2168);
 RIFTD_SHM_ASSERT(devices, offsetof(riftd_shm, devices) == 264);
 RIFTD_SHM_ASSERT(sensors, offsetof(riftd_shm, sensors) == 1924);
 
