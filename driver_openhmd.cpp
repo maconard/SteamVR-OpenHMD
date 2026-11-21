@@ -1242,6 +1242,23 @@ public:
             vr::VRProperties()->SetBoolProperty( m_ulPropertyContainer, Prop_ContainsProximitySensor_Bool, hasProximity );
             if (hasProximity)
                 vr::VRDriverInput()->CreateBooleanComponent( m_ulPropertyContainer, "/proximity", &m_proximity );
+
+            // Oculus Remote buttons, reported as HMD controls; its Oculus and volume buttons are not in the profile
+            const riftd_device d = SnapDevice(RIFTD_DEV_HMD);
+            for (int i = 0; i < d.control_count && i < RIFTD_MAX_CONTROLS; i++) {
+                const char *path = NULL;
+                switch (d.control_hints[i]) {
+                case OHMD_BUTTON_Y: path = "/input/remote_dpad/up/click"; break;
+                case OHMD_BUTTON_A: path = "/input/remote_dpad/down/click"; break;
+                case OHMD_BUTTON_X: path = "/input/remote_dpad/left/click"; break;
+                case OHMD_BUTTON_B: path = "/input/remote_dpad/right/click"; break;
+                case OHMD_GENERIC: path = "/input/remote_dpad/enter/click"; break;
+                case OHMD_HOME: path = "/input/remote_back/click"; break;
+                default: break;
+                }
+                if (path)
+                    vr::VRDriverInput()->CreateBooleanComponent( m_ulPropertyContainer, path, &m_remote[i] );
+            }
         }
 
         return VRInitError_None;
@@ -1688,6 +1705,12 @@ public:
             ReleaseSRWLockShared(&g_snapLock);
             vr::VRDriverInput()->UpdateBooleanComponent( m_proximity, worn, 0 );
         }
+        if (g_riftd) {
+            const riftd_device d = SnapDevice(RIFTD_DEV_HMD);
+            for (int i = 0; i < RIFTD_MAX_CONTROLS; i++)
+                if (m_remote[i] != k_ulInvalidInputComponentHandle)
+                    vr::VRDriverInput()->UpdateBooleanComponent( m_remote[i], d.controls[i] != 0, 0 );
+        }
     }
 
     std::string GetSerialNumber() const { return m_sSerialNumber; }
@@ -1700,6 +1723,7 @@ private:
     bool m_cv1 = false;
     bool m_oculusIdentity = false;
     vr::VRInputComponentHandle_t m_proximity = k_ulInvalidInputComponentHandle;
+    vr::VRInputComponentHandle_t m_remote[RIFTD_MAX_CONTROLS] = {}; // k_ulInvalidInputComponentHandle is 0
     Cv1Optics m_optics;
 
     vr::TrackedDeviceIndex_t m_unObjectId;
