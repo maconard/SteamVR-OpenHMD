@@ -50,23 +50,37 @@ bool g_snapFresh = false;
 #if defined( _WINDOWS )
 class RiftdClient {
 public:
-    bool Open(int timeout_ms)
+    RiftdClient()
     {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
         m_freq = f.QuadPart;
-        for (int t = 0; t <= timeout_ms; t += 250) {
-            if (!m_shm) {
-                m_map = OpenFileMappingA(FILE_MAP_READ, FALSE, RIFTD_SHM_NAME);
-                if (m_map)
-                    m_shm = (const riftd_shm *)MapViewOfFile(m_map, FILE_MAP_READ, 0, 0, sizeof(riftd_shm));
-            }
-            if (m_shm && m_shm->magic == RIFTD_SHM_MAGIC && m_shm->version == RIFTD_SHM_VERSION &&
-                m_shm->size == sizeof(riftd_shm) && m_shm->state == RIFTD_STATE_READY && Snapshot(&g_snap))
+    }
+
+    bool Open(int64_t deadline)
+    {
+        for (;;) {
+            if (Ready())
                 return true;
+            if (Now() >= deadline)
+                return false;
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
-        return false;
+    }
+
+    bool Ready()
+    {
+        if (!m_shm) {
+            m_map = OpenFileMappingA(FILE_MAP_READ, FALSE, RIFTD_SHM_NAME);
+            if (m_map)
+                m_shm = (const riftd_shm *)MapViewOfFile(m_map, FILE_MAP_READ, 0, 0, sizeof(riftd_shm));
+            if (m_map && !m_shm) {
+                CloseHandle(m_map);
+                m_map = NULL;
+            }
+        }
+        return m_shm && m_shm->magic == RIFTD_SHM_MAGIC && m_shm->version == RIFTD_SHM_VERSION &&
+            m_shm->size == sizeof(riftd_shm) && m_shm->state == RIFTD_STATE_READY && Snapshot(&g_snap);
     }
 
     bool Snapshot(riftd_shm *out)
@@ -91,8 +105,14 @@ public:
     bool Update()
     {
         static riftd_shm next;
-        if (!m_shm)
-            return false;
+        if (!m_shm) {
+            // riftd was not running at Init; look for it once a second
+            if (Now() - m_lastOpenTry < m_freq)
+                return false;
+            m_lastOpenTry = Now();
+            if (!Ready())
+                return false;
+        }
         if (Snapshot(&next))
             g_snap = next;
         return g_snap.state == RIFTD_STATE_READY && Now() - g_snap.heartbeat_qpc < m_freq / 2;
@@ -107,13 +127,66 @@ public:
 
     double SampleAge(const riftd_device &d) { return (double)(Now() - d.sample_qpc) / m_freq; }
 
+    int64_t Freq() { return m_freq; }
+
 private:
     HANDLE m_map = NULL;
     const riftd_shm *m_shm = NULL;
     int64_t m_freq = 1;
+    int64_t m_lastOpenTry = 0;
 };
 RiftdClient g_riftdClient;
+
+// Last ready riftd state (display and device descriptions), so vrserver can add the devices when it
+// starts before riftd: %LOCALAPPDATA%\openhmd\riftd-devices.bin
+static std::string RiftdCachePath()
+{
+    char dir[MAX_PATH];
+    DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", dir, sizeof(dir));
+    if (n == 0 || n >= sizeof(dir))
+        return "";
+    std::string path = std::string(dir) + "\\openhmd";
+    CreateDirectoryA(path.c_str(), NULL);
+    return path + "\\riftd-devices.bin";
+}
+
+static void SaveRiftdCache(const riftd_shm &s)
+{
+    std::string path = RiftdCachePath();
+    FILE *f = path.empty() ? NULL : fopen(path.c_str(), "wb");
+    if (!f)
+        return;
+    fwrite(&s, sizeof(s), 1, f);
+    fclose(f);
+}
+
+static bool LoadRiftdCache(riftd_shm *s)
+{
+    std::string path = RiftdCachePath();
+    FILE *f = path.empty() ? NULL : fopen(path.c_str(), "rb");
+    if (!f)
+        return false;
+    bool ok = fread(s, sizeof(*s), 1, f) == 1 && s->magic == RIFTD_SHM_MAGIC && s->version == RIFTD_SHM_VERSION &&
+        s->size == sizeof(*s) && s->display.h_resolution > 0;
+    fclose(f);
+    return ok;
+}
 #endif
+
+static int64_t QpcNow()
+{
+#if defined( _WINDOWS )
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+#else
+    return 0;
+#endif
+}
+
+// Driver Init must return well within vrserver's watchdog (about 20 s) or SteamVR enters safe mode;
+// waits for riftd and for the HMD display end at this deadline.
+int64_t g_initDeadline = 0;
 
 static void FillDisplayFromOpenHMD(ohmd_device *hmd, riftd_display *d)
 {
@@ -559,7 +632,7 @@ public:
 		pose.vecDriverFromHeadTranslation[i] = 0.0;
 		pose.vecWorldFromDriverTranslation[i] = 0.0;
 	}
-	pose.vecWorldFromDriverTranslation[1] = g_flHeadHeight;
+	pose.vecWorldFromDriverTranslation[1] = (g_riftd && m_hadOptical) ? 0.0 : g_flHeadHeight;
 
 	if (m_is_oculus) {
 		const HmdQuaternion_t oculusOffsetQ  = { 0.966, 0.259, 0, 0};
@@ -735,9 +808,12 @@ public:
 
 #if defined( _WINDOWS )
         // The CV1 panel only appears as a desktop display once the HMD is opened; the compositor
-        // fails with InvalidOutputDesktop if it starts before Windows has attached it.
+        // fails with InvalidOutputDesktop if it starts before Windows has attached it. A ready
+        // riftd has already waited for it, so the riftd backend only checks once.
         bool found = false;
-        for (int tries = 0; tries < 60 && !found; tries++) {
+        int64_t waitStart = QpcNow();
+        int tries;
+        for (tries = 0; !found; tries++) {
             DISPLAY_DEVICEA dd = { sizeof(dd) };
             for (DWORD i = 0; EnumDisplayDevicesA(NULL, i, &dd, 0); i++, dd.cb = sizeof(dd)) {
                 DEVMODEA dm = {};
@@ -751,14 +827,17 @@ public:
                     break;
                 }
             }
-            if (!found)
-                std::this_thread::sleep_for( std::chrono::milliseconds(250) );
+            if (found || g_riftd || QpcNow() >= g_initDeadline)
+                break;
+            std::this_thread::sleep_for( std::chrono::milliseconds(250) );
         }
         if (!found)
-            DriverLog("driver_openhmd: no %dx%d display at %d,%d after 15 s; check windowX/windowY\n", m_nWindowWidth, m_nWindowHeight, m_nWindowX, m_nWindowY);
+            DriverLog("driver_openhmd: no %dx%d display at %d,%d after %.1f s; check windowX/windowY\n", m_nWindowWidth, m_nWindowHeight,
+                      m_nWindowX, m_nWindowY, (double)(QpcNow() - waitStart) / g_riftdClient.Freq());
+        else if (tries > 0)
+            // the compositor fails with InvalidOutputDesktop on a panel that attached a moment ago
+            std::this_thread::sleep_for( std::chrono::seconds(1) );
 #endif
-	/* Sleep for 1 second while activating to let the display connect */
-	std::this_thread::sleep_for( std::chrono::seconds(1) );
     }
 
     virtual ~COpenHMDDeviceDriver()
@@ -782,6 +861,16 @@ public:
 
         // return a constant that's not 0 (invalid) or 1 (reserved for Oculus)
         vr::VRProperties()->SetUint64Property( m_ulPropertyContainer, Prop_CurrentUniverseId_Uint64, 2 );
+
+        // A calibrated universe keeps vrmonitor from launching Room Setup at every start. Standing
+        // and seated are the raw tracking space; the bounds are hidden.
+        static const vr::ETrackedDeviceProperty Prop_DriverProvidedChaperoneJson_String = (vr::ETrackedDeviceProperty)2095;
+        vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_DriverProvidedChaperoneJson_String,
+            "{\"jsonid\":\"chaperone_info\",\"version\":5,\"time\":\"2026-11-20T00:00:00\",\"universes\":[{\"universeID\":\"2\","
+            "\"play_area\":[4.0,4.0],\"collision_bounds\":[[[-2,0,-2],[-2,2.4,-2],[2,2.4,-2],[2,0,-2]],[[2,0,-2],[2,2.4,-2],[2,2.4,2],[2,0,2]],"
+            "[[2,0,2],[2,2.4,2],[-2,2.4,2],[-2,0,2]],[[-2,0,2],[-2,2.4,2],[-2,2.4,-2],[-2,0,-2]]],"
+            "\"seated\":{\"translation\":[0,0,0],\"yaw\":0},\"standing\":{\"translation\":[0,0,0],\"yaw\":0}}]}" );
+        vr::VRProperties()->SetBoolProperty( m_ulPropertyContainer, Prop_DriverProvidedChaperoneVisibility_Bool, false );
 
         return VRInitError_None;
     }
@@ -1128,10 +1217,12 @@ public:
     {
         DriverPose_t pose = { 0 };
         if (g_riftd) {
-            RiftdPose(g_snap.devices[RIFTD_DEV_HMD], pose, true);
+            if (RiftdPose(g_snap.devices[RIFTD_DEV_HMD], pose, true))
+                m_hadOptical = true;
             pose.qWorldFromDriverRotation = identityquat;
             pose.qDriverFromHeadRotation = identityquat;
-            pose.vecWorldFromDriverTranslation[1] = g_flHeadHeight;
+            // headHeight only lifts the rotation-only fallback position; optical positions are used as tracked
+            pose.vecWorldFromDriverTranslation[1] = m_hadOptical ? 0.0 : g_flHeadHeight;
             return pose;
         }
         pose.poseIsValid = true;
@@ -1182,6 +1273,7 @@ private:
     ohmd_device* hmd = NULL;
     ohmd_device* hmdtracker = NULL;
     riftd_display m_display = {};
+    bool m_hadOptical = false;
 
     vr::TrackedDeviceIndex_t m_unObjectId;
     vr::PropertyContainerHandle_t m_ulPropertyContainer;
@@ -1236,6 +1328,9 @@ EVRInitError CServerDriver_OpenHMD::Init( vr::IVRDriverContext *pDriverContext )
 {
     VR_INIT_SERVER_DRIVER_CONTEXT( pDriverContext );
     InitDriverLog( vr::VRDriverLog() );
+#if defined( _WINDOWS )
+    g_initDeadline = QpcNow() + 12 * g_riftdClient.Freq();
+#endif
 
     vr::EVRSettingsError herr = vr::VRSettingsError_None;
     float head_height = vr::VRSettings()->GetFloat( k_pch_Sample_Section, "headHeight", &herr );
@@ -1250,19 +1345,25 @@ EVRInitError CServerDriver_OpenHMD::Init( vr::IVRDriverContext *pDriverContext )
 #if defined( _WINDOWS )
         herr = vr::VRSettingsError_None;
         int32_t timeout = vr::VRSettings()->GetInt32( k_pch_Sample_Section, "riftdTimeout", &herr );
-        // vrserver counts a driver Init that blocks for about 20 s as a crash and enters safe mode
-        if (herr != vr::VRSettingsError_None || timeout <= 0)
+        if (herr != vr::VRSettingsError_None || timeout < 0)
             timeout = 10;
-        if (timeout > 15)
-            timeout = 15;
+        if (timeout > 12)
+            timeout = 12;
         DriverLog("driver_openhmd: backend riftd, waiting up to %d s for %s\n", timeout, RIFTD_SHM_NAME);
-        if (!g_riftdClient.Open(timeout * 1000)) {
-            DriverLog("driver_openhmd: riftd not running or not ready after %d s; start build\\arm64\\tracker\\riftd.exe or set driver_openhmd.backend to openhmd\n", timeout);
+        int64_t deadline = QpcNow() + timeout * g_riftdClient.Freq();
+        if (g_riftdClient.Open(deadline < g_initDeadline ? deadline : g_initDeadline)) {
+            g_snapFresh = true;
+            DriverLog("driver_openhmd: riftd pid %u ready, %u sensors\n", g_snap.pid, g_snap.n_sensors);
+        } else if (LoadRiftdCache(&g_snap)) {
+            // Failing Init here would make SteamVR blame the driver; the devices stay disconnected until riftd is ready
+            g_snapFresh = false;
+            DriverLog("driver_openhmd: riftd not ready after %d s; adding the devices it last reported, disconnected until it is ready\n", timeout);
+        } else {
+            DriverLog("driver_openhmd: riftd not ready after %d s and no %s; start build\\arm64\\tracker\\riftd.exe or set driver_openhmd.backend to openhmd\n",
+                      timeout, RiftdCachePath().c_str());
             return VRInitError_Init_HmdNotFound;
         }
         g_riftd = true;
-        g_snapFresh = true;
-        DriverLog("driver_openhmd: riftd pid %u ready, %u sensors\n", g_snap.pid, g_snap.n_sensors);
 
         m_OpenHMDDeviceDriver = new COpenHMDDeviceDriver(-1, -1);
         vr::VRServerDriverHost()->TrackedDeviceAdded( m_OpenHMDDeviceDriver->GetSerialNumber().c_str(), vr::TrackedDeviceClass_HMD, m_OpenHMDDeviceDriver );
@@ -1374,9 +1475,14 @@ void CServerDriver_OpenHMD::RunFrame()
 {
 #if defined( _WINDOWS )
     if (g_riftd) {
+        static bool cached = false;
         bool fresh = g_riftdClient.Update();
         if (fresh != g_snapFresh)
-            DriverLog("driver_openhmd: riftd %s\n", fresh ? "updating again" : "stopped updating; devices marked invalid");
+            DriverLog("driver_openhmd: riftd %s\n", fresh ? "updating" : "stopped updating; devices marked invalid");
+        if (fresh && !cached) {
+            SaveRiftdCache(g_snap);
+            cached = true;
+        }
         g_snapFresh = fresh;
     } else
 #endif

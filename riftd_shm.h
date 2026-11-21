@@ -48,7 +48,7 @@ typedef struct riftd_device {
 	float position[3];            /* m, OpenHMD tracking space */
 	float orientation[4];         /* x, y, z, w */
 	float linear_velocity[3];     /* m/s */
-	float angular_velocity[3];    /* rad/s */
+	float angular_velocity[3];    /* rad/s, device frame (DriverPose_t convention) */
 
 	int32_t control_count;
 	int32_t control_hints[RIFTD_MAX_CONTROLS];  /* ohmd_control_hint */
