@@ -682,7 +682,9 @@ public:
 	}
 	pose.vecWorldFromDriverTranslation[1] = (g_riftd && m_hadOptical) ? 0.0 : g_flHeadHeight;
 
-	if (m_is_oculus) {
+	// riftd reports Touch in its calibration (LED model) frame, which Monado also passes on as the grip
+	// pose without an offset; this offset only suits upstream OpenHMD's 3DoF Touch rotation.
+	if (m_is_oculus && !g_riftd) {
 		const HmdQuaternion_t oculusOffsetQ  = { 0.966, 0.259, 0, 0};
 
 		pose.qDriverFromHeadRotation = oculusOffsetQ;
