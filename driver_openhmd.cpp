@@ -20,6 +20,7 @@
 
 #include <openhmd.h>
 #include "riftd_shm.h"
+#include "cv1_optics.h"
 
 #ifndef _USE_MATH_DEFINES
 #define _USE_MATH_DEFINES
@@ -924,7 +925,7 @@ public:
         m_ulPropertyContainer = vr::k_ulInvalidPropertyContainer;
 
         DriverLog( "Using settings values\n" );
-        m_flIPD = m_display.ipd;
+        m_flIPD = DesiredIpd();
 
         m_sSerialNumber = product + ": " + path;
         m_sModelNumber = "OpenHMD: " + product;
@@ -949,8 +950,36 @@ public:
         if (serr != vr::VRSettingsError_None) m_nWindowY = 0;
         m_nWindowWidth = m_nRenderWidth = m_display.h_resolution;
         m_nWindowHeight = m_nRenderHeight = m_display.v_resolution;
-        //m_nRenderWidth /= 2;
-        //m_nRenderHeight /= 2;
+
+        m_cv1 = product.find("CV1") != std::string::npos && m_display.h_resolution == 2160 && m_display.v_resolution == 1200;
+        if (m_cv1) {
+            char model[32] = "libovr";
+            vr::EVRSettingsError derr = vr::VRSettingsError_None;
+            vr::VRSettings()->GetString( k_pch_Sample_Section, "distortion", model, sizeof(model), &derr );
+            if (derr != vr::VRSettingsError_None || !Cv1Optics::Parse(model, &m_optics.model)) {
+                if (derr == vr::VRSettingsError_None)
+                    DriverLog("driver_openhmd: unknown distortion \"%s\", using libovr\n", model);
+                m_optics.model = Cv1Optics::LIBOVR;
+            }
+            m_optics.panelW = m_display.h_size;
+            m_optics.panelH = m_display.v_size;
+            m_optics.lensSep = m_display.lens_separation;
+            m_optics.lensFromTop = m_display.lens_v_position;
+            // OpenHMD's projection is a frustum to the panel edges, so m00 = 2 n / (h_size / 2)
+            if (m_display.left_projection[0] > 0.5f)
+                m_optics.eyeToScreen = m_display.left_projection[0] * m_display.h_size / 4;
+            m_optics.eyePxW = m_display.h_resolution / 2;
+            m_optics.eyePxH = m_display.v_resolution;
+            m_optics.Init();
+            unsigned w, h;
+            m_optics.RenderSize(&w, &h);
+            m_nRenderWidth = (int32_t)w;
+            m_nRenderHeight = (int32_t)h;
+            DriverLog("driver_openhmd: CV1 optics %s: panel %.5f x %.5f m, lens separation %.4f, lens %.5f from top, eye to screen %.5f; "
+                      "left eye tangents outer %.4f inner %.4f up %.4f down %.4f\n", Cv1Optics::Name(m_optics.model),
+                      m_optics.panelW, m_optics.panelH, m_optics.lensSep, m_optics.lensFromTop, m_optics.eyeToScreen,
+                      m_optics.tanOuter, m_optics.tanInner, m_optics.tanUp, m_optics.tanDown);
+        }
 
         m_flSecondsFromVsyncToPhotons = vr::VRSettings()->GetFloat( k_pch_Sample_Section, k_pch_Sample_SecondsFromVsyncToPhotons_Float );
         //TODO: find actual frequency somehow (from openhmd?)
@@ -977,17 +1006,34 @@ public:
         int tries;
         for (tries = 0; !found; tries++) {
             DISPLAY_DEVICEA dd = { sizeof(dd) };
+            // Windows moves the Rift when another monitor comes or goes, so an Oculus monitor of
+            // the panel size elsewhere replaces windowX/windowY
+            bool moved = false;
+            POINTL movedTo = {};
             for (DWORD i = 0; EnumDisplayDevicesA(NULL, i, &dd, 0); i++, dd.cb = sizeof(dd)) {
                 DEVMODEA dm = {};
                 dm.dmSize = sizeof(dm);
-                if ((dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) &&
-                    EnumDisplaySettingsA(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm) &&
-                    dm.dmPosition.x == m_nWindowX && dm.dmPosition.y == m_nWindowY &&
-                    (int32_t)dm.dmPelsWidth == m_nWindowWidth && (int32_t)dm.dmPelsHeight == m_nWindowHeight) {
+                if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) ||
+                    !EnumDisplaySettingsA(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm) ||
+                    (int32_t)dm.dmPelsWidth != m_nWindowWidth || (int32_t)dm.dmPelsHeight != m_nWindowHeight)
+                    continue;
+                if (dm.dmPosition.x == m_nWindowX && dm.dmPosition.y == m_nWindowY) {
                     DriverLog("driver_openhmd: HMD display %s attached at %d Hz after %d ms\n", dd.DeviceName, (int)dm.dmDisplayFrequency, tries * 250);
                     found = true;
                     break;
                 }
+                DISPLAY_DEVICEA mon = { sizeof(mon) };
+                if (EnumDisplayDevicesA(dd.DeviceName, 0, &mon, 0) && strstr(mon.DeviceID, "\\OVR")) {
+                    moved = true;
+                    movedTo = dm.dmPosition;
+                }
+            }
+            if (!found && moved) {
+                DriverLog("driver_openhmd: HMD display is at %d,%d, not windowX/windowY %d,%d; using %d,%d\n",
+                          (int)movedTo.x, (int)movedTo.y, m_nWindowX, m_nWindowY, (int)movedTo.x, (int)movedTo.y);
+                m_nWindowX = movedTo.x;
+                m_nWindowY = movedTo.y;
+                found = true;
             }
             if (found || g_riftd || QpcNow() >= g_initDeadline)
                 break;
@@ -1014,6 +1060,7 @@ public:
 
         vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, Prop_ManufacturerName_String, m_sVendor.c_str());
         vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_ModelNumber_String, m_sModelNumber.c_str() );
+        m_flIPD = DesiredIpd();
         vr::VRProperties()->SetFloatProperty( m_ulPropertyContainer, Prop_UserIpdMeters_Float, m_flIPD );
         vr::VRProperties()->SetFloatProperty( m_ulPropertyContainer, Prop_UserHeadToEyeDepthMeters_Float, 0.f );
         vr::VRProperties()->SetFloatProperty( m_ulPropertyContainer, Prop_DisplayFrequency_Float, m_flDisplayFrequency );
@@ -1083,6 +1130,7 @@ public:
         return true;
     }
 
+    // per eye
     void GetRecommendedRenderTargetSize( uint32_t *pnWidth, uint32_t *pnHeight )
     {
         *pnWidth = m_nRenderWidth;
@@ -1226,6 +1274,11 @@ public:
 
     void GetProjectionRaw( EVREye eEye, float *pfLeft, float *pfRight, float *pfTop, float *pfBottom )
     {
+        if (m_cv1) {
+            m_optics.Projection(eEye == Eye_Left, pfLeft, pfRight, pfTop, pfBottom);
+            DriverLog("driver_openhmd: eye %d projection tangents l %.4f r %.4f t %.4f b %.4f\n", eEye, *pfLeft, *pfRight, *pfTop, *pfBottom);
+            return;
+        }
         mat4x4f ohmdprojection;
         memcpy(ohmdprojection.arr, eEye == Eye_Left ? m_display.left_projection : m_display.right_projection, sizeof(ohmdprojection.arr));
 
@@ -1290,6 +1343,18 @@ public:
 
     DistortionCoordinates_t ComputeDistortion( EVREye eEye, float fU, float fV )
     {
+        if (m_cv1) {
+            float c[3][2];
+            m_optics.Distort(eEye == Eye_Left, fU, fV, c);
+            DistortionCoordinates_t d;
+            d.rfRed[0] = c[0][0];
+            d.rfRed[1] = c[0][1];
+            d.rfGreen[0] = c[1][0];
+            d.rfGreen[1] = c[1][1];
+            d.rfBlue[0] = c[2][0];
+            d.rfBlue[1] = c[2][1];
+            return d;
+        }
         float angle = (eEye == Eye_Left ? rotation_left : rotation_right);
         
         //DriverLog("Eye %d before: %f %f\n", eEye, fU, fV);
@@ -1418,6 +1483,33 @@ public:
     }
 
 
+    // driver_openhmd.ipd (m) overrides the headset's; riftd reports the CV1 lens spacing slider
+    float DesiredIpd()
+    {
+        float ipd = SettingFloat("ipd", 0.0f, 0.1f);
+        if (ipd >= 0.04f)
+            return ipd;
+        if (g_riftd) {
+            AcquireSRWLockShared(&g_snapLock);
+            ipd = g_snap.display.ipd;
+            ReleaseSRWLockShared(&g_snapLock);
+        } else {
+            ipd = m_display.ipd;
+        }
+        return ipd >= 0.04f && ipd <= 0.09f ? ipd : 0.0635f;
+    }
+
+    // called about once a second
+    void UpdateIpd()
+    {
+        float ipd = DesiredIpd();
+        if (m_ulPropertyContainer == vr::k_ulInvalidPropertyContainer || fabsf(ipd - m_flIPD) < 0.0002f)
+            return;
+        DriverLog("driver_openhmd: IPD %.1f mm\n", ipd * 1000);
+        m_flIPD = ipd;
+        vr::VRProperties()->SetFloatProperty( m_ulPropertyContainer, Prop_UserIpdMeters_Float, m_flIPD );
+    }
+
     void RunFrame()
     {
         // In a real driver, this should happen from some pose tracking thread.
@@ -1436,6 +1528,8 @@ private:
     ohmd_device* hmdtracker = NULL;
     riftd_display m_display = {};
     bool m_hadOptical = false;
+    bool m_cv1 = false;
+    Cv1Optics m_optics;
 
     vr::TrackedDeviceIndex_t m_unObjectId;
     vr::PropertyContainerHandle_t m_ulPropertyContainer;
@@ -1644,6 +1738,8 @@ void CServerDriver_OpenHMD::RunFrame()
         // drivers get no settings-changed event; polling lets vrset changes apply live
         if (QpcNow() - lastSettings > g_riftdClient.Freq()) {
             ReadTouchOffset();
+            if (m_OpenHMDDeviceDriver)
+                m_OpenHMDDeviceDriver->UpdateIpd();
             lastSettings = QpcNow();
         }
         if (fresh != g_snapFresh)
