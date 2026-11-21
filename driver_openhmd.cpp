@@ -86,11 +86,15 @@ public:
         return false;
     }
 
-    // Snapshot plus a check that riftd is still writing.
+    // Snapshot plus a check that riftd is still writing. A read that keeps colliding with the
+    // writer (riftd preempted mid-write) keeps the previous snapshot.
     bool Update()
     {
-        if (!m_shm || !Snapshot(&g_snap))
+        static riftd_shm next;
+        if (!m_shm)
             return false;
+        if (Snapshot(&next))
+            g_snap = next;
         return g_snap.state == RIFTD_STATE_READY && Now() - g_snap.heartbeat_qpc < m_freq / 2;
     }
 
@@ -1246,8 +1250,11 @@ EVRInitError CServerDriver_OpenHMD::Init( vr::IVRDriverContext *pDriverContext )
 #if defined( _WINDOWS )
         herr = vr::VRSettingsError_None;
         int32_t timeout = vr::VRSettings()->GetInt32( k_pch_Sample_Section, "riftdTimeout", &herr );
+        // vrserver counts a driver Init that blocks for about 20 s as a crash and enters safe mode
         if (herr != vr::VRSettingsError_None || timeout <= 0)
-            timeout = 30;
+            timeout = 10;
+        if (timeout > 15)
+            timeout = 15;
         DriverLog("driver_openhmd: backend riftd, waiting up to %d s for %s\n", timeout, RIFTD_SHM_NAME);
         if (!g_riftdClient.Open(timeout * 1000)) {
             DriverLog("driver_openhmd: riftd not running or not ready after %d s; start build\\arm64\\tracker\\riftd.exe or set driver_openhmd.backend to openhmd\n", timeout);
