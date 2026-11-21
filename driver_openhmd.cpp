@@ -668,12 +668,15 @@ public:
               break;
             case OHMD_SQUEEZE:
               control_map = "/input/grip/value";
+              if (g_riftd && m_is_oculus)
+                m_grip = i;
               break;
             case OHMD_MENU:
               control_map = "/input/system/click";
               break;
             case OHMD_HOME:
-                // TODO: this button doesn't have an input in touch_profile.json
+              // touch_profile.json declares /input/system for the left menu button only; the Oculus
+              // runtime keeps the right Oculus button for itself
               control_map = "/input/system/click";
               break;
             case OHMD_ANALOG_X:
@@ -731,6 +734,8 @@ public:
           for (int k = 0; k < 3; k++)
             vr::VRDriverInput()->CreateScalarComponent( m_ulPropertyContainer, extra[k], m_extraTouch + k, VRScalarType_Absolute, VRScalarUnits_NormalizedOneSided);
           vr::VRDriverInput()->CreateHapticComponent( m_ulPropertyContainer, "/output/haptic", &m_haptic );
+          if (m_grip >= 0)
+            vr::VRDriverInput()->CreateBooleanComponent( m_ulPropertyContainer, "/input/grip/touch", &m_gripTouch );
         }
 
         return VRInitError_None;
@@ -871,6 +876,12 @@ public:
           for (int k = 0; k < 3; k++)
             if (m_extraTouch[k] != k_ulInvalidInputComponentHandle)
               vr::VRDriverInput()->UpdateScalarComponent( m_extraTouch[k], touch_state[2 + k], 0 );
+          // the grip has no capacitive sensor
+          if (m_gripTouch != k_ulInvalidInputComponentHandle) {
+            float g = control_state[m_grip];
+            m_gripTouched = m_gripTouched ? g > 0.05f : g > 0.15f;
+            vr::VRDriverInput()->UpdateBooleanComponent( m_gripTouch, m_gripTouched, 0 );
+          }
         }
     }
 
@@ -919,6 +930,9 @@ public:
 private:
     bool m_homeDown = false;
     int64_t m_homeSince = 0;
+    int m_grip = -1;
+    vr::VRInputComponentHandle_t m_gripTouch = k_ulInvalidInputComponentHandle;
+    bool m_gripTouched = false;
     std::string m_sSerialNumber = "Controller serial number " + std::to_string(index);
     std::string m_sModelNumber = "Controller model number " + std::to_string(index);
     vr::TrackedDeviceIndex_t m_unObjectId;
