@@ -18,6 +18,7 @@
 #endif
 
 #include <openhmd.h>
+#include "riftd_shm.h"
 
 #define _USE_MATH_DEFINES
 #include <math.h>
@@ -39,6 +40,145 @@ using namespace vr;
 ohmd_context* ctx;
 // rotation-only devices report position 0; lift the tracking origin so the head is not at floor level
 float g_flHeadHeight = 1.6f;
+
+// driver_openhmd.backend = "riftd": poses, inputs and display parameters come from the riftd
+// shared memory (riftd_shm.h) instead of OpenHMD in this process.
+bool g_riftd = false;
+riftd_shm g_snap;
+bool g_snapFresh = false;
+
+#if defined( _WINDOWS )
+class RiftdClient {
+public:
+    bool Open(int timeout_ms)
+    {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        m_freq = f.QuadPart;
+        for (int t = 0; t <= timeout_ms; t += 250) {
+            if (!m_shm) {
+                m_map = OpenFileMappingA(FILE_MAP_READ, FALSE, RIFTD_SHM_NAME);
+                if (m_map)
+                    m_shm = (const riftd_shm *)MapViewOfFile(m_map, FILE_MAP_READ, 0, 0, sizeof(riftd_shm));
+            }
+            if (m_shm && m_shm->magic == RIFTD_SHM_MAGIC && m_shm->version == RIFTD_SHM_VERSION &&
+                m_shm->size == sizeof(riftd_shm) && m_shm->state == RIFTD_STATE_READY && Snapshot(&g_snap))
+                return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+        return false;
+    }
+
+    bool Snapshot(riftd_shm *out)
+    {
+        for (int tries = 0; tries < 1000; tries++) {
+            uint32_t seq = m_shm->seq;
+            if (seq & 1) {
+                YieldProcessor();
+                continue;
+            }
+            MemoryBarrier();
+            memcpy(out, (const void *)m_shm, sizeof(*out));
+            MemoryBarrier();
+            if (m_shm->seq == seq)
+                return true;
+        }
+        return false;
+    }
+
+    // Snapshot plus a check that riftd is still writing.
+    bool Update()
+    {
+        if (!m_shm || !Snapshot(&g_snap))
+            return false;
+        return g_snap.state == RIFTD_STATE_READY && Now() - g_snap.heartbeat_qpc < m_freq / 2;
+    }
+
+    int64_t Now()
+    {
+        LARGE_INTEGER t;
+        QueryPerformanceCounter(&t);
+        return t.QuadPart;
+    }
+
+    double SampleAge(const riftd_device &d) { return (double)(Now() - d.sample_qpc) / m_freq; }
+
+private:
+    HANDLE m_map = NULL;
+    const riftd_shm *m_shm = NULL;
+    int64_t m_freq = 1;
+};
+RiftdClient g_riftdClient;
+#endif
+
+static void FillDisplayFromOpenHMD(ohmd_device *hmd, riftd_display *d)
+{
+    ohmd_device_geti(hmd, OHMD_SCREEN_HORIZONTAL_RESOLUTION, &d->h_resolution);
+    ohmd_device_geti(hmd, OHMD_SCREEN_VERTICAL_RESOLUTION, &d->v_resolution);
+    ohmd_device_getf(hmd, OHMD_SCREEN_HORIZONTAL_SIZE, &d->h_size);
+    ohmd_device_getf(hmd, OHMD_SCREEN_VERTICAL_SIZE, &d->v_size);
+    ohmd_device_getf(hmd, OHMD_LENS_HORIZONTAL_SEPARATION, &d->lens_separation);
+    ohmd_device_getf(hmd, OHMD_LENS_VERTICAL_POSITION, &d->lens_v_position);
+    ohmd_device_getf(hmd, OHMD_EYE_IPD, &d->ipd);
+    ohmd_device_getf(hmd, OHMD_UNIVERSAL_DISTORTION_K, d->universal_distortion_k);
+    ohmd_device_getf(hmd, OHMD_UNIVERSAL_ABERRATION_K, d->universal_aberration_k);
+    ohmd_device_getf(hmd, OHMD_LEFT_EYE_GL_PROJECTION_MATRIX, d->left_projection);
+    ohmd_device_getf(hmd, OHMD_RIGHT_EYE_GL_PROJECTION_MATRIX, d->right_projection);
+}
+
+static void FillDeviceFromOpenHMD(int idx, ohmd_device *dev, riftd_device *d)
+{
+    int hints[64] = { 0 }, types[64] = { 0 }, n = 0;
+    strncpy(d->vendor, ohmd_list_gets(ctx, idx, OHMD_VENDOR), sizeof(d->vendor) - 1);
+    strncpy(d->product, ohmd_list_gets(ctx, idx, OHMD_PRODUCT), sizeof(d->product) - 1);
+    strncpy(d->path, ohmd_list_gets(ctx, idx, OHMD_PATH), sizeof(d->path) - 1);
+    ohmd_list_geti(ctx, idx, OHMD_DEVICE_FLAGS, &d->ohmd_flags);
+    ohmd_device_geti(dev, OHMD_CONTROL_COUNT, &n);
+    if (n > RIFTD_MAX_CONTROLS)
+        n = RIFTD_MAX_CONTROLS;
+    ohmd_device_geti(dev, OHMD_CONTROLS_HINTS, hints);
+    ohmd_device_geti(dev, OHMD_CONTROLS_TYPES, types);
+    d->control_count = n;
+    memcpy(d->control_hints, hints, n * sizeof(int));
+    memcpy(d->control_types, types, n * sizeof(int));
+}
+
+// Fills the tracking fields of pose from a riftd device. Returns true when it has an optical fix.
+static bool RiftdPose(const riftd_device &d, DriverPose_t &pose, bool is_hmd)
+{
+    bool valid = g_snapFresh && (d.flags & RIFTD_DEVICE_POSE_VALID);
+    bool optical = valid && (d.flags & RIFTD_DEVICE_OPTICAL);
+
+    pose.deviceIsConnected = g_snapFresh && (d.flags & RIFTD_DEVICE_CONNECTED);
+    pose.poseIsValid = valid;
+    // IMU-only head rotation stays Running_OK: OutOfRange on the HMD fades the view to the grid
+    if (!valid)
+        pose.result = TrackingResult_Running_OutOfRange;
+    else if (optical || is_hmd)
+        pose.result = TrackingResult_Running_OK;
+    else
+        pose.result = TrackingResult_Running_OutOfRange;
+
+    pose.qRotation.x = d.orientation[0];
+    pose.qRotation.y = d.orientation[1];
+    pose.qRotation.z = d.orientation[2];
+    pose.qRotation.w = d.orientation[3];
+    for (int i = 0; i < 3; i++) {
+        pose.vecPosition[i] = d.position[i];
+        bool vel = valid && (d.flags & RIFTD_DEVICE_VELOCITY);
+        pose.vecVelocity[i] = vel ? d.linear_velocity[i] : 0.0;
+        pose.vecAngularVelocity[i] = vel ? d.angular_velocity[i] : 0.0;
+        pose.vecAcceleration[i] = 0.0;
+        pose.vecAngularAcceleration[i] = 0.0;
+    }
+    if (pose.qRotation.w == 0 && pose.qRotation.x == 0 && pose.qRotation.y == 0 && pose.qRotation.z == 0)
+        pose.qRotation.w = 1;
+#if defined( _WINDOWS )
+    double age = g_riftdClient.SampleAge(d);
+    pose.poseTimeOffset = age > 0.1 ? -0.1 : (age < 0 ? 0 : -age);
+#endif
+    return optical;
+}
 
 class COpenHMDDeviceDriverController;
 
@@ -167,16 +307,24 @@ public:
     int device_flags;
     DriverPose_t pose;
 
-    bool m_is_oculus;
+    bool m_is_oculus = false;
+    // static device info; with the riftd backend device is NULL and device_idx is a riftd_device_index
+    riftd_device m_info = {};
+    bool m_hadOptical = false;
+    double m_defaultPosition[3] = { 0, 0, 0 };
 
     COpenHMDDeviceDriverController(int index, ohmd_device* _device, int _device_idx) :
 		index(index), device(_device), device_idx(_device_idx) {
-        DriverLog("construct controller object %d (OpenHMD device %d)\n", index, device_idx);
+        DriverLog("construct controller object %d (%s device %d)\n", index, g_riftd ? "riftd" : "OpenHMD", device_idx);
         m_unObjectId = vr::k_unTrackedDeviceIndexInvalid;
         pose = { 0 };
 
+        if (g_riftd)
+            m_info = g_snap.devices[device_idx];
+        else
+            FillDeviceFromOpenHMD(device_idx, device, &m_info);
 
-        if (strcmp(ohmd_list_gets(ctx, device_idx, OHMD_VENDOR), "Oculus VR, Inc.") == 0) {
+        if (strcmp(m_info.vendor, "Oculus VR, Inc.") == 0) {
             m_is_oculus = true;
             DriverLog("detected oculus controllers, using oculus input profile");
         }
@@ -188,15 +336,15 @@ public:
         DriverLog("activate controller %d: %d\n", index, unObjectId);
         m_unObjectId = unObjectId;
 
-        if (this->device == NULL) {
+        if (this->device == NULL && !g_riftd) {
           return VRInitError_Init_InterfaceNotFound;
         }
 
         m_ulPropertyContainer = vr::VRProperties()->TrackedDeviceToPropertyContainer( m_unObjectId );
 
-        const char *controllerModel = ohmd_list_gets(ctx, device_idx, OHMD_PRODUCT);
+        const char *controllerModel = m_info.product;
 
-	ohmd_list_geti(ctx, device_idx, OHMD_DEVICE_FLAGS, &device_flags);
+	device_flags = m_info.ohmd_flags;
 
         vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_ModelNumber_String, controllerModel);
         //vr::VRProperties()->SetStringProperty( m_ulPropertyContainer, Prop_RenderModelName_String, controllerModel);
@@ -243,23 +391,19 @@ public:
 	   pose.vecPosition[1] = -0.5;
 	   pose.vecPosition[2] = 0.15;
 	}
+	for (int i = 0; i < 3; i++)
+	    m_defaultPosition[i] = pose.vecPosition[i];
 
 
-        int control_count;
-        ohmd_device_geti(device, OHMD_CONTROL_COUNT, &control_count);
-        if (control_count > 64)
-          control_count = 64;
+        int control_count = m_info.control_count;
 
         const char* controls_fn_str[] = { "generic", "trigger", "trigger_click", "squeeze", "menu", "home",
                 "analog-x", "analog-y", "anlog_press", "button-a", "button-b", "button-x", "button-y",
                 "volume-up", "volume-down", "mic-mute"};
         const char* controls_type_str[] = {"digital", "analog"};
 
-        int controls_fn[64];
-        int controls_types[64];
-
-        ohmd_device_geti(device, OHMD_CONTROLS_HINTS, controls_fn);
-        ohmd_device_geti(device, OHMD_CONTROLS_TYPES, controls_types);
+        const int32_t *controls_fn = m_info.control_hints;
+        const int32_t *controls_types = m_info.control_types;
 
         for(int i = 0; i < control_count; i++){
           DriverLog("%s (%s)%s\n", controls_fn_str[controls_fn[i]], controls_type_str[controls_types[i]], i == control_count - 1 ? "" : ", ");
@@ -375,11 +519,20 @@ public:
 
     DriverPose_t GetPose()
     {
+	if (g_riftd) {
+		if (RiftdPose(g_snap.devices[device_idx], pose, false))
+			m_hadOptical = true;
+		// until the cameras have seen it, hold the controller at the rotation-only default spot
+		if (!m_hadOptical)
+			for (int i = 0; i < 3; i++)
+				pose.vecPosition[i] = m_defaultPosition[i];
+	} else {
 	pose.poseIsValid = true;
 	pose.result = TrackingResult_Running_OK;
 	pose.deviceIsConnected = true;
+	}
 
-	if (device_flags & OHMD_DEVICE_FLAGS_ROTATIONAL_TRACKING) {
+	if (!g_riftd && (device_flags & OHMD_DEVICE_FLAGS_ROTATIONAL_TRACKING)) {
 		float quat[4];
 		ohmd_device_getf(device, OHMD_ROTATION_QUAT, quat);
 		pose.qRotation.x = quat[0];
@@ -388,7 +541,7 @@ public:
 		pose.qRotation.w = quat[3];
 	}
 
-	if (device_flags & OHMD_DEVICE_FLAGS_POSITIONAL_TRACKING) {
+	if (!g_riftd && (device_flags & OHMD_DEVICE_FLAGS_POSITIONAL_TRACKING)) {
 		float pos[3];
 		ohmd_device_getf(device, OHMD_POSITION_VECTOR, pos);
 		pose.vecPosition[0] = pos[0];
@@ -423,14 +576,13 @@ public:
     void RunFrame() {
         vr::VRServerDriverHost()->TrackedDevicePoseUpdated(m_unObjectId, GetPose(), sizeof( DriverPose_t ) );
 
-        int control_count;
-        float control_state[256];
+        int control_count = m_info.control_count;
+        float control_state[256] = { 0 };
 
-        ohmd_device_geti(device, OHMD_CONTROL_COUNT, &control_count);
-        if (control_count > 64)
-          control_count = 64;
-
-        ohmd_device_getf(device, OHMD_CONTROLS_STATE, control_state);
+        if (g_riftd)
+          memcpy(control_state, g_snap.devices[device_idx].controls, control_count * sizeof(float));
+        else
+          ohmd_device_getf(device, OHMD_CONTROLS_STATE, control_state);
 
         for (int i = 0; i < control_count; i++) {
           if (m_buttons[i] != k_ulInvalidInputComponentHandle) {
@@ -490,6 +642,15 @@ class COpenHMDDeviceDriver final : public vr::ITrackedDeviceServerDriver, public
 public:
     COpenHMDDeviceDriver(int hmddisplay_idx, int hmdtracker_idx)
     {
+        std::string product, path, vendor;
+
+        if (g_riftd) {
+            const riftd_device &d = g_snap.devices[RIFTD_DEV_HMD];
+            m_display = g_snap.display;
+            product = d.product;
+            path = d.path;
+            vendor = d.vendor;
+        } else {
         hmd = ohmd_list_open_device(ctx, hmddisplay_idx);
         if (hmdtracker_idx != -1 && hmdtracker_idx != hmddisplay_idx)
 	    hmdtracker = ohmd_list_open_device(ctx, hmdtracker_idx);
@@ -500,10 +661,11 @@ public:
             DriverLog("failed to open device: %s\n", ohmd_ctx_get_error(ctx));
         }
 
-        int ivals[2];
-        ohmd_device_geti(hmd, OHMD_SCREEN_HORIZONTAL_RESOLUTION, ivals);
-        ohmd_device_geti(hmd, OHMD_SCREEN_VERTICAL_RESOLUTION, ivals + 1);
-        //DriverLog("resolution:              %i x %i\n", ivals[0], ivals[1]);
+        FillDisplayFromOpenHMD(hmd, &m_display);
+        product = ohmd_list_gets(ctx, hmddisplay_idx, OHMD_PRODUCT);
+        path = ohmd_list_gets(ctx, hmddisplay_idx, OHMD_PATH);
+        vendor = ohmd_list_gets(ctx, hmddisplay_idx, OHMD_VENDOR);
+        }
 
         /*
         print_infof(hmd, "hsize:",            1, OHMD_SCREEN_HORIZONTAL_SIZE);
@@ -523,29 +685,17 @@ public:
         m_ulPropertyContainer = vr::k_ulInvalidPropertyContainer;
 
         DriverLog( "Using settings values\n" );
-        ohmd_device_getf(hmd, OHMD_EYE_IPD, &m_flIPD);
-        
-        {
-            std::stringstream buf;
-            buf << ohmd_list_gets(ctx, hmddisplay_idx, OHMD_PRODUCT);
-            buf << ": ";
-            buf << ohmd_list_gets(ctx, hmddisplay_idx, OHMD_PATH);
-            m_sSerialNumber = buf.str();
-        }
+        m_flIPD = m_display.ipd;
 
-        {
-            std::stringstream buf;
-            buf << "OpenHMD: ";
-            buf << ohmd_list_gets(ctx, hmddisplay_idx, OHMD_PRODUCT);
-            m_sModelNumber = buf.str();
-        }
+        m_sSerialNumber = product + ": " + path;
+        m_sModelNumber = "OpenHMD: " + product;
 
         // Important to pass vendor through. Gaze cursor is only available for "Oculus". So grab the first word.
         char const* vendor_override = getenv("OHMD_VENDOR_OVERRIDE");
         if (vendor_override) {
             m_sVendor = vendor_override;
         } else {
-            m_sVendor = ohmd_list_gets(ctx, hmddisplay_idx, OHMD_VENDOR);
+            m_sVendor = vendor;
             if (m_sVendor.find(' ') != std::string::npos) {
                 m_sVendor = m_sVendor.substr(0, m_sVendor.find(' '));
             }
@@ -558,10 +708,8 @@ public:
         serr = vr::VRSettingsError_None;
         m_nWindowY = vr::VRSettings()->GetInt32( k_pch_Sample_Section, "windowY", &serr );
         if (serr != vr::VRSettingsError_None) m_nWindowY = 0;
-        ohmd_device_geti(hmd, OHMD_SCREEN_HORIZONTAL_RESOLUTION, &m_nWindowWidth);
-        ohmd_device_geti(hmd, OHMD_SCREEN_VERTICAL_RESOLUTION, &m_nWindowHeight );
-        ohmd_device_geti(hmd, OHMD_SCREEN_HORIZONTAL_RESOLUTION, &m_nRenderWidth);
-        ohmd_device_geti(hmd, OHMD_SCREEN_VERTICAL_RESOLUTION, &m_nRenderHeight );
+        m_nWindowWidth = m_nRenderWidth = m_display.h_resolution;
+        m_nWindowHeight = m_nRenderHeight = m_display.v_resolution;
         //m_nRenderWidth /= 2;
         //m_nRenderHeight /= 2;
 
@@ -578,8 +726,7 @@ public:
                                                 DriverLog( "driver_openhmd: Display Frequency: %f\n", m_flDisplayFrequency );
         DriverLog( "driver_openhmd: IPD: %f\n", m_flIPD );
 
-        float distortion_coeffs[4];
-        ohmd_device_getf(hmd, OHMD_UNIVERSAL_DISTORTION_K, &(distortion_coeffs[0]));
+        const float *distortion_coeffs = m_display.universal_distortion_k;
         DriverLog("driver_openhmd: Distortion values a=%f b=%f c=%f d=%f\n", distortion_coeffs[0], distortion_coeffs[1], distortion_coeffs[2], distortion_coeffs[3]);
 
 #if defined( _WINDOWS )
@@ -825,11 +972,7 @@ public:
     void GetProjectionRaw( EVREye eEye, float *pfLeft, float *pfRight, float *pfTop, float *pfBottom )
     {
         mat4x4f ohmdprojection;
-        if (eEye == Eye_Left) {
-            ohmd_device_getf(hmd, OHMD_LEFT_EYE_GL_PROJECTION_MATRIX, ohmdprojection.arr);
-        } else {
-            ohmd_device_getf(hmd, OHMD_RIGHT_EYE_GL_PROJECTION_MATRIX, ohmdprojection.arr);
-        }
+        memcpy(ohmdprojection.arr, eEye == Eye_Left ? m_display.left_projection : m_display.right_projection, sizeof(ohmdprojection.arr));
 
         float yaw, pitch, roll;
         float p[4][4];
@@ -914,29 +1057,18 @@ public:
         
         //DriverLog("Eye %d after: %f %f\n", eEye, fU, fV);
         
-        int hmd_w;
-        int hmd_h;
-        ohmd_device_geti(hmd, OHMD_SCREEN_HORIZONTAL_RESOLUTION, &hmd_w);
-        ohmd_device_geti(hmd, OHMD_SCREEN_VERTICAL_RESOLUTION, &hmd_h);
-        float ipd;
-        ohmd_device_getf(hmd, OHMD_EYE_IPD, &ipd);
         float viewport_scale[2];
-        float distortion_coeffs[4];
-        float aberr_scale[3];
-        float sep;
+        const float *distortion_coeffs = m_display.universal_distortion_k;
+        const float *aberr_scale = m_display.universal_aberration_k;
+        float sep = m_display.lens_separation;
         float left_lens_center[2];
         float right_lens_center[2];
         //viewport is half the screen
-        ohmd_device_getf(hmd, OHMD_SCREEN_HORIZONTAL_SIZE, &(viewport_scale[0]));
-        viewport_scale[0] /= 2.0f;
-        ohmd_device_getf(hmd, OHMD_SCREEN_VERTICAL_SIZE, &(viewport_scale[1]));
-        //distortion coefficients
-        ohmd_device_getf(hmd, OHMD_UNIVERSAL_DISTORTION_K, &(distortion_coeffs[0]));
-        ohmd_device_getf(hmd, OHMD_UNIVERSAL_ABERRATION_K, &(aberr_scale[0]));
+        viewport_scale[0] = m_display.h_size / 2.0f;
+        viewport_scale[1] = m_display.v_size;
         //calculate lens centers (assuming the eye separation is the distance betweenteh lense centers)
-        ohmd_device_getf(hmd, OHMD_LENS_HORIZONTAL_SEPARATION, &sep);
-        ohmd_device_getf(hmd, OHMD_LENS_VERTICAL_POSITION, &(left_lens_center[1]));
-        ohmd_device_getf(hmd, OHMD_LENS_VERTICAL_POSITION, &(right_lens_center[1]));
+        left_lens_center[1] = m_display.lens_v_position;
+        right_lens_center[1] = m_display.lens_v_position;
         left_lens_center[0] = viewport_scale[0] - sep/2.0f;
         right_lens_center[0] = sep/2.0f;
         //asume calibration was for lens view to which ever edge of screen is further away from lens center
@@ -991,6 +1123,13 @@ public:
     DriverPose_t GetPose()
     {
         DriverPose_t pose = { 0 };
+        if (g_riftd) {
+            RiftdPose(g_snap.devices[RIFTD_DEV_HMD], pose, true);
+            pose.qWorldFromDriverRotation = identityquat;
+            pose.qDriverFromHeadRotation = identityquat;
+            pose.vecWorldFromDriverTranslation[1] = g_flHeadHeight;
+            return pose;
+        }
         pose.poseIsValid = true;
         pose.result = TrackingResult_Running_OK;
         pose.deviceIsConnected = true;
@@ -1038,6 +1177,7 @@ public:
 private:
     ohmd_device* hmd = NULL;
     ohmd_device* hmdtracker = NULL;
+    riftd_display m_display = {};
 
     vr::TrackedDeviceIndex_t m_unObjectId;
     vr::PropertyContainerHandle_t m_ulPropertyContainer;
@@ -1098,6 +1238,41 @@ EVRInitError CServerDriver_OpenHMD::Init( vr::IVRDriverContext *pDriverContext )
     if (herr == vr::VRSettingsError_None)
         g_flHeadHeight = head_height;
     DriverLog("driver_openhmd: head height %f\n", g_flHeadHeight);
+
+    char backend[64] = "";
+    herr = vr::VRSettingsError_None;
+    vr::VRSettings()->GetString( k_pch_Sample_Section, "backend", backend, sizeof(backend), &herr );
+    if (strcmp(backend, "riftd") == 0) {
+#if defined( _WINDOWS )
+        herr = vr::VRSettingsError_None;
+        int32_t timeout = vr::VRSettings()->GetInt32( k_pch_Sample_Section, "riftdTimeout", &herr );
+        if (herr != vr::VRSettingsError_None || timeout <= 0)
+            timeout = 30;
+        DriverLog("driver_openhmd: backend riftd, waiting up to %d s for %s\n", timeout, RIFTD_SHM_NAME);
+        if (!g_riftdClient.Open(timeout * 1000)) {
+            DriverLog("driver_openhmd: riftd not running or not ready after %d s; start build\\arm64\\tracker\\riftd.exe or set driver_openhmd.backend to openhmd\n", timeout);
+            return VRInitError_Init_HmdNotFound;
+        }
+        g_riftd = true;
+        g_snapFresh = true;
+        DriverLog("driver_openhmd: riftd pid %u ready, %u sensors\n", g_snap.pid, g_snap.n_sensors);
+
+        m_OpenHMDDeviceDriver = new COpenHMDDeviceDriver(-1, -1);
+        vr::VRServerDriverHost()->TrackedDeviceAdded( m_OpenHMDDeviceDriver->GetSerialNumber().c_str(), vr::TrackedDeviceClass_HMD, m_OpenHMDDeviceDriver );
+        if (g_snap.devices[RIFTD_DEV_LEFT].flags & RIFTD_DEVICE_PRESENT) {
+            m_OpenHMDDeviceDriverControllerL = new COpenHMDDeviceDriverController(0, NULL, RIFTD_DEV_LEFT);
+            vr::VRServerDriverHost()->TrackedDeviceAdded( m_OpenHMDDeviceDriverControllerL->GetSerialNumber().c_str(), vr::TrackedDeviceClass_Controller, m_OpenHMDDeviceDriverControllerL );
+        }
+        if (g_snap.devices[RIFTD_DEV_RIGHT].flags & RIFTD_DEVICE_PRESENT) {
+            m_OpenHMDDeviceDriverControllerR = new COpenHMDDeviceDriverController(1, NULL, RIFTD_DEV_RIGHT);
+            vr::VRServerDriverHost()->TrackedDeviceAdded( m_OpenHMDDeviceDriverControllerR->GetSerialNumber().c_str(), vr::TrackedDeviceClass_Controller, m_OpenHMDDeviceDriverControllerR );
+        }
+        return VRInitError_None;
+#else
+        DriverLog("driver_openhmd: backend riftd is Windows only\n");
+        return VRInitError_Init_HmdNotFound;
+#endif
+    }
 
     ctx = ohmd_ctx_create();
     int num_devices = ohmd_ctx_probe(ctx);
@@ -1190,6 +1365,14 @@ void CServerDriver_OpenHMD::Cleanup()
 
 void CServerDriver_OpenHMD::RunFrame()
 {
+#if defined( _WINDOWS )
+    if (g_riftd) {
+        bool fresh = g_riftdClient.Update();
+        if (fresh != g_snapFresh)
+            DriverLog("driver_openhmd: riftd %s\n", fresh ? "updating again" : "stopped updating; devices marked invalid");
+        g_snapFresh = fresh;
+    } else
+#endif
     ohmd_ctx_update(ctx);
 
     if ( m_OpenHMDDeviceDriver )
