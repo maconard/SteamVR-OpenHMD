@@ -122,7 +122,24 @@ typedef struct riftd_room_request {
 	float offset[4];
 } riftd_room_request;
 
+/* Touch vibration requests, written by the driver, polled by riftd. Per controller (index
+ * RIFTD_DEV_LEFT - 1, RIFTD_DEV_RIGHT - 1): increment seq to an odd value, write the fields,
+ * increment it to an even value. riftd applies each new even seq; amplitude or duration 0 stops. */
+#define RIFTD_HAPTIC_NAME "Local\\riftd-haptic"
+
+typedef struct riftd_haptic_pulse {
+	volatile uint32_t seq;
+	float amplitude;              /* 0..1 */
+	float frequency;              /* Hz; the CV1 Touch vibrates at 160 or 320 Hz */
+	float duration;               /* s */
+} riftd_haptic_pulse;
+
+typedef struct riftd_haptic_request {
+	riftd_haptic_pulse hand[2];
+} riftd_haptic_request;
+
 #define RIFTD_SHM_ASSERT(name, cond) typedef char riftd_shm_assert_##name[(cond) ? 1 : -1]
+RIFTD_SHM_ASSERT(haptic, sizeof(riftd_haptic_request) == 32);
 RIFTD_SHM_ASSERT(size, sizeof(riftd_shm) == 2128);
 RIFTD_SHM_ASSERT(devices, offsetof(riftd_shm, devices) == 264);
 RIFTD_SHM_ASSERT(sensors, offsetof(riftd_shm, sensors) == 1924);

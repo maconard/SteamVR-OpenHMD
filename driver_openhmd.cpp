@@ -165,11 +165,35 @@ public:
 
     double SampleAge(const riftd_device &d) { return (double)(Now() - d.sample_qpc) / m_freq; }
 
+    // hand: 0 left, 1 right
+    void Haptic(int hand, float amplitude, float frequency, float duration)
+    {
+        if (!m_haptic) {
+            HANDLE map = OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, RIFTD_HAPTIC_NAME);
+            if (map)
+                m_haptic = (riftd_haptic_request *)MapViewOfFile(map, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(riftd_haptic_request));
+            if (map && !m_haptic)
+                CloseHandle(map);
+            if (!m_haptic)
+                return;
+        }
+        riftd_haptic_pulse *p = &m_haptic->hand[hand];
+        // an odd seq left by a vrserver that died mid-write
+        if (p->seq & 1)
+            InterlockedIncrement((volatile LONG *)&p->seq);
+        InterlockedIncrement((volatile LONG *)&p->seq);
+        p->amplitude = amplitude;
+        p->frequency = frequency;
+        p->duration = duration;
+        InterlockedIncrement((volatile LONG *)&p->seq);
+    }
+
     int64_t Freq() { return m_freq; }
 
 private:
     HANDLE m_map = NULL;
     const riftd_shm *m_shm = NULL;
+    riftd_haptic_request *m_haptic = NULL;
     int64_t m_freq = 1;
     int64_t m_lastOpenTry = 0;
 };
@@ -695,6 +719,7 @@ public:
           const char *extra[3] = { "/input/thumbrest/touch", "/input/joystick/touch", "/input/trigger/touch" };
           for (int k = 0; k < 3; k++)
             vr::VRDriverInput()->CreateScalarComponent( m_ulPropertyContainer, extra[k], m_extraTouch + k, VRScalarType_Absolute, VRScalarUnits_NormalizedOneSided);
+          vr::VRDriverInput()->CreateHapticComponent( m_ulPropertyContainer, "/output/haptic", &m_haptic );
         }
 
         return VRInitError_None;
@@ -860,6 +885,8 @@ public:
         DriverLog("get controller serial number %s\n", m_sSerialNumber.c_str());
         return m_sSerialNumber;
     }
+
+    vr::VRInputComponentHandle_t m_haptic = k_ulInvalidInputComponentHandle;
 
 private:
     std::string m_sSerialNumber = "Controller serial number " + std::to_string(index);
@@ -1752,6 +1779,19 @@ void CServerDriver_OpenHMD::RunFrame()
     } else
 #endif
     ohmd_ctx_update(ctx);
+
+    vr::VREvent_t ev;
+    while (vr::VRServerDriverHost()->PollNextEvent(&ev, sizeof(ev))) {
+        if (ev.eventType != vr::VREvent_Input_HapticVibration)
+            continue;
+#if defined( _WINDOWS )
+        const vr::VREvent_HapticVibration_t &h = ev.data.hapticVibration;
+        COpenHMDDeviceDriverController *hands[2] = { m_OpenHMDDeviceDriverControllerL, m_OpenHMDDeviceDriverControllerR };
+        for (COpenHMDDeviceDriverController *c : hands)
+            if (g_riftd && c && c->m_haptic != k_ulInvalidInputComponentHandle && c->m_haptic == h.componentHandle)
+                g_riftdClient.Haptic(c->device_idx - RIFTD_DEV_LEFT, h.fAmplitude, h.fFrequency, h.fDurationSeconds);
+#endif
+    }
 
     if ( m_OpenHMDDeviceDriver )
         m_OpenHMDDeviceDriver->RunFrame();
