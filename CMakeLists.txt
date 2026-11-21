@@ -34,7 +34,8 @@ add_library(driver_openhmd SHARED
 )
 
 if(MSVC)
-  target_compile_options(driver_openhmd PRIVATE /W3)
+  string(REGEX REPLACE "/W[0-4]" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  target_compile_options(driver_openhmd PRIVATE /W4 /WX /external:anglebrackets /external:W0)
   target_compile_definitions(driver_openhmd PRIVATE _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
 else(MSVC)
   target_compile_options(driver_openhmd PRIVATE -Wall) #-Wextra -Wno-unused-parameter) #-pedantic)

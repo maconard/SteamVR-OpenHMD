@@ -48,6 +48,7 @@ void DriverLog( const char *pMsgFormat, ... )
 
 void DebugDriverLog( const char *pMsgFormat, ... )
 {
+	(void)pMsgFormat;
 #ifdef _DEBUG
 	va_list args;
 	va_start( args, pMsgFormat );
