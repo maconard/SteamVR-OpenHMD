@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstring>
 #include <sstream>
+#include <atomic>
 
 #if defined( _WINDOWS )
 #include <windows.h>
@@ -20,7 +21,9 @@
 #include <openhmd.h>
 #include "riftd_shm.h"
 
+#ifndef _USE_MATH_DEFINES
 #define _USE_MATH_DEFINES
+#endif
 #include <math.h>
 #include <stdio.h>
 
@@ -45,7 +48,25 @@ float g_flHeadHeight = 1.6f;
 // shared memory (riftd_shm.h) instead of OpenHMD in this process.
 bool g_riftd = false;
 riftd_shm g_snap;
-bool g_snapFresh = false;
+std::atomic<bool> g_snapFresh(false);
+// guards g_snap: written by the server RunFrame, read by device GetPose and RunFrame, which can run on other threads
+#if defined( _WINDOWS )
+SRWLOCK g_snapLock = SRWLOCK_INIT;
+#else
+#define AcquireSRWLockShared(l)
+#define ReleaseSRWLockShared(l)
+#define AcquireSRWLockExclusive(l)
+#define ReleaseSRWLockExclusive(l)
+int g_snapLock;
+#endif
+
+static riftd_device SnapDevice(int idx)
+{
+    AcquireSRWLockShared(&g_snapLock);
+    riftd_device d = g_snap.devices[idx];
+    ReleaseSRWLockShared(&g_snapLock);
+    return d;
+}
 
 #if defined( _WINDOWS )
 class RiftdClient {
@@ -79,8 +100,18 @@ public:
                 m_map = NULL;
             }
         }
-        return m_shm && m_shm->magic == RIFTD_SHM_MAGIC && m_shm->version == RIFTD_SHM_VERSION &&
-            m_shm->size == sizeof(riftd_shm) && m_shm->state == RIFTD_STATE_READY && Snapshot(&g_snap);
+        static riftd_shm first;
+        if (!(m_shm && Header(m_shm) && m_shm->state == RIFTD_STATE_READY && Snapshot(&first)))
+            return false;
+        AcquireSRWLockExclusive(&g_snapLock);
+        g_snap = first;
+        ReleaseSRWLockExclusive(&g_snapLock);
+        return true;
+    }
+
+    static bool Header(const riftd_shm *s)
+    {
+        return s->magic == RIFTD_SHM_MAGIC && s->version == RIFTD_SHM_VERSION && s->size == sizeof(riftd_shm);
     }
 
     bool Snapshot(riftd_shm *out)
@@ -113,8 +144,14 @@ public:
             if (!Ready())
                 return false;
         }
-        if (Snapshot(&next))
+        if (Snapshot(&next)) {
+            // a stopped riftd or a different shm layout counts as riftd gone
+            if (!Header(&next))
+                return false;
+            AcquireSRWLockExclusive(&g_snapLock);
             g_snap = next;
+            ReleaseSRWLockExclusive(&g_snapLock);
+        }
         return g_snap.state == RIFTD_STATE_READY && Now() - g_snap.heartbeat_qpc < m_freq / 2;
     }
 
@@ -490,6 +527,7 @@ public:
           m_buttons[i] = k_ulInvalidInputComponentHandle;
           m_analogControls[i] = k_ulInvalidInputComponentHandle;
           m_touchControls[i] = k_ulInvalidInputComponentHandle;
+          m_touchCap[i] = -1;
 
           // TODO: inputs match steamapps/common/SteamVR/drivers/oculus/resources/input/touch_profile.json
           // but also support other controllers
@@ -527,18 +565,22 @@ public:
             case OHMD_BUTTON_A:
               control_map = "/input/a/click";
               touch_map = "/input/a/touch";
+              m_touchCap[i] = 0;
               break;
             case OHMD_BUTTON_B:
               control_map = "/input/b/click";
               touch_map = "/input/b/touch";
+              m_touchCap[i] = 1;
               break;
             case OHMD_BUTTON_X:
               control_map = "/input/x/click";
               touch_map = "/input/x/touch";
+              m_touchCap[i] = 0;
               break;
             case OHMD_BUTTON_Y:
               control_map = "/input/y/click";
               touch_map = "/input/y/touch";
+              m_touchCap[i] = 1;
               break;
 
             default:
@@ -557,6 +599,12 @@ public:
 	  if (touch_map != NULL) {
               vr::VRDriverInput()->CreateScalarComponent( m_ulPropertyContainer, touch_map, m_touchControls + i, VRScalarType_Absolute, analog_type);
           }
+        }
+
+        if (g_riftd && m_is_oculus) {
+          const char *extra[3] = { "/input/thumbrest/touch", "/input/joystick/touch", "/input/trigger/touch" };
+          for (int k = 0; k < 3; k++)
+            vr::VRDriverInput()->CreateScalarComponent( m_ulPropertyContainer, extra[k], m_extraTouch + k, VRScalarType_Absolute, VRScalarUnits_NormalizedOneSided);
         }
 
         return VRInitError_None;
@@ -588,7 +636,7 @@ public:
     }
 
     /** debug request from a client */
-    void DebugRequest( const char *pchRequest, char *pchResponseBuffer, uint32_t unResponseBufferSize )
+    void DebugRequest( const char *, char *pchResponseBuffer, uint32_t unResponseBufferSize )
     {
         if( unResponseBufferSize >= 1 )
             pchResponseBuffer[0] = 0;
@@ -597,7 +645,7 @@ public:
     DriverPose_t GetPose()
     {
 	if (g_riftd) {
-		if (RiftdPose(g_snap.devices[device_idx], pose, false))
+		if (RiftdPose(SnapDevice(device_idx), pose, false))
 			m_hadOptical = true;
 		// until the cameras have seen it, hold the controller at the rotation-only default spot
 		if (!m_hadOptical)
@@ -655,10 +703,15 @@ public:
 
         int control_count = m_info.control_count;
         float control_state[256] = { 0 };
+        float touch_state[5] = { 0 };
 
-        if (g_riftd)
-          memcpy(control_state, g_snap.devices[device_idx].controls, control_count * sizeof(float));
-        else
+        if (g_riftd) {
+          riftd_device snap = SnapDevice(device_idx);
+          if (control_count > RIFTD_MAX_CONTROLS)
+            control_count = RIFTD_MAX_CONTROLS;
+          memcpy(control_state, snap.controls, control_count * sizeof(float));
+          memcpy(touch_state, snap.touch, sizeof(touch_state));
+        } else
           ohmd_device_getf(device, OHMD_CONTROLS_STATE, control_state);
 
         for (int i = 0; i < control_count; i++) {
@@ -667,10 +720,15 @@ public:
           }
           else if (m_analogControls[i] != k_ulInvalidInputComponentHandle)
             vr::VRDriverInput()->UpdateScalarComponent( m_analogControls[i], control_state[i], 0 );
-	  /* If the control is not 0, mark it touched */
           if (m_touchControls[i] != k_ulInvalidInputComponentHandle) {
-            vr::VRDriverInput()->UpdateScalarComponent( m_touchControls[i], control_state[i] == 0 ? 0.0 : 1.0, 0 );
+            float touched = (g_riftd && m_touchCap[i] >= 0) ? touch_state[m_touchCap[i]] : (control_state[i] == 0 ? 0.0f : 1.0f);
+            vr::VRDriverInput()->UpdateScalarComponent( m_touchControls[i], touched, 0 );
           }
+        }
+        if (g_riftd) {
+          for (int k = 0; k < 3; k++)
+            if (m_extraTouch[k] != k_ulInvalidInputComponentHandle)
+              vr::VRDriverInput()->UpdateScalarComponent( m_extraTouch[k], touch_state[2 + k], 0 );
         }
     }
 
@@ -691,7 +749,7 @@ public:
     return controllerstate;
     }
 
-    bool TriggerHapticPulse( uint32_t unAxisId, uint16_t usPulseDurationMicroseconds ) {
+    bool TriggerHapticPulse( uint32_t, uint16_t ) {
         return false;
     }
 
@@ -712,6 +770,8 @@ private:
     vr::VRInputComponentHandle_t m_analogControls[64]; /* Maximum components we support */
     /* Touch controls */
     vr::VRInputComponentHandle_t m_touchControls[64]; /* Maximum components we support */
+    int m_touchCap[64]; /* index into riftd_device.touch for m_touchControls[i], -1 if none */
+    vr::VRInputComponentHandle_t m_extraTouch[3] = { k_ulInvalidInputComponentHandle, k_ulInvalidInputComponentHandle, k_ulInvalidInputComponentHandle }; /* thumb rest, stick, trigger */
 };
 
 class COpenHMDDeviceDriver final : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponent
@@ -897,7 +957,7 @@ public:
     {
     }
 
-    void DebugRequest( const char *pchRequest, char *pchResponseBuffer, uint32_t unResponseBufferSize )
+    void DebugRequest( const char *, char *pchResponseBuffer, uint32_t unResponseBufferSize )
     {
         if( unResponseBufferSize >= 1 )
             pchResponseBuffer[0] = 0;
@@ -1015,9 +1075,9 @@ public:
             cosYaw = 1;
         }
 
-        *yaw   = atan2(sinYaw, cosYaw) * 180 / M_PI;
-        *pitch = atan2(sinPitch, cosPitch) * 180 / M_PI;
-        *roll  = atan2(sinRoll, cosRoll) * 180 / M_PI;
+        *yaw   = (float)(atan2(sinYaw, cosYaw) * 180 / M_PI);
+        *pitch = (float)(atan2(sinPitch, cosPitch) * 180 / M_PI);
+        *roll  = (float)(atan2(sinRoll, cosRoll) * 180 / M_PI);
     } 
     
     typedef union {
@@ -1135,7 +1195,7 @@ public:
         if (angle > -5 && angle < 5) {
         } else if (angle > 85 && angle < 95) {
             float tmp = fV;
-            fV = 1. - fU;
+            fV = 1.f - fU;
             fU = tmp;
         } else if (angle > -95 && angle < -85) {
             float tmp = fV;
@@ -1217,7 +1277,7 @@ public:
     {
         DriverPose_t pose = { 0 };
         if (g_riftd) {
-            if (RiftdPose(g_snap.devices[RIFTD_DEV_HMD], pose, true))
+            if (RiftdPose(SnapDevice(RIFTD_DEV_HMD), pose, true))
                 m_hadOptical = true;
             pose.qWorldFromDriverRotation = identityquat;
             pose.qDriverFromHeadRotation = identityquat;

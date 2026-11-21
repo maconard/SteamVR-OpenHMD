@@ -10,6 +10,7 @@
 #ifndef RIFTD_SHM_H
 #define RIFTD_SHM_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define RIFTD_SHM_NAME "Local\\riftd-shm"
@@ -103,5 +104,10 @@ typedef struct riftd_shm {
 	uint32_t n_sensors;
 	riftd_sensor sensors[RIFTD_MAX_SENSORS];
 } riftd_shm;
+
+#define RIFTD_SHM_ASSERT(name, cond) typedef char riftd_shm_assert_##name[(cond) ? 1 : -1]
+RIFTD_SHM_ASSERT(size, sizeof(riftd_shm) == 2088);
+RIFTD_SHM_ASSERT(devices, offsetof(riftd_shm, devices) == 264);
+RIFTD_SHM_ASSERT(sensors, offsetof(riftd_shm, sensors) == 1924);
 
 #endif
