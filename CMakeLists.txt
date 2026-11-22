@@ -31,6 +31,8 @@ add_library(driver_openhmd SHARED
   driverlog.cpp
   driverlog.h
   driver_openhmd.cpp
+  hand_skeleton.cpp
+  hand_skeleton.h
 )
 
 if(MSVC)

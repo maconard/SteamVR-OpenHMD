@@ -25,6 +25,7 @@
 #include <openhmd.h>
 #include "riftd_shm.h"
 #include "cv1_optics.h"
+#include "hand_skeleton.h"
 
 #ifndef _USE_MATH_DEFINES
 #define _USE_MATH_DEFINES
@@ -500,6 +501,59 @@ static HmdQuaternion_t QMul(const HmdQuaternion_t &a, const HmdQuaternion_t &b)
              a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
              a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w };
 }
+
+#if defined( _WINDOWS )
+static bool ReadWholeFile(const std::wstring &path, std::vector<uint8_t> &out)
+{
+    FILE *f = _wfopen(path.c_str(), L"rb");
+    if (!f)
+        return false;
+    out.clear();
+    uint8_t buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0 && out.size() < (64u << 20))
+        out.insert(out.end(), buf, buf + n);
+    fclose(f);
+    return !out.empty();
+}
+
+static std::string Utf8(const std::wstring &w)
+{
+    char buf[1024];
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, buf, sizeof(buf), NULL, NULL);
+    return n > 0 ? std::string(buf) : std::string("?");
+}
+#endif
+
+// Reference hand poses from the SteamVR install that runs this driver, loaded once.
+static bool LoadHandPosesOnce()
+{
+    static int state = -1; // -1 not tried, 0 failed, 1 loaded
+    if (state >= 0)
+        return state == 1;
+    state = 0;
+#if defined( _WINDOWS )
+    // vrserver.exe is <SteamVR>\bin\win64\vrserver.exe
+    wchar_t exe[MAX_PATH];
+    DWORD len = GetModuleFileNameW(NULL, exe, MAX_PATH);
+    std::wstring root(exe, len < MAX_PATH ? len : 0);
+    for (int i = 0; i < 3 && !root.empty(); i++)
+        root.resize(root.find_last_of(L"\\/") == std::wstring::npos ? 0 : root.find_last_of(L"\\/"));
+    std::wstring touchPath = root + L"\\drivers\\oculus\\resources\\anims\\touch_poses_right.glb";
+    std::wstring handPath = root + L"\\resources\\anims\\hand_right_poses.glb";
+    std::vector<uint8_t> touch, hand;
+    std::string err;
+    if (!ReadWholeFile(touchPath, touch) || !ReadWholeFile(handPath, hand))
+        DriverLog("hand skeleton: cannot read %s or %s, no finger tracking\n", Utf8(touchPath).c_str(), Utf8(handPath).c_str());
+    else if (!LoadHandPoses(touch, hand, &err))
+        DriverLog("hand skeleton: %s, no finger tracking\n", err.c_str());
+    else {
+        DriverLog("hand skeleton: poses from %s\n", Utf8(root).c_str());
+        state = 1;
+    }
+#endif
+    return state == 1;
+}
 //-----------------------------------------------------------------------------
 // Purpose:
 //-----------------------------------------------------------------------------
@@ -722,6 +776,7 @@ public:
               break;
             case OHMD_TRIGGER:
               control_map = "/input/trigger/value";
+              m_trigger = i;
               break;
             case OHMD_TRIGGER_CLICK:
               control_map = "/input/trigger/click";
@@ -742,10 +797,12 @@ public:
             case OHMD_ANALOG_X:
               control_map = "/input/joystick/x";
               analog_type = VRScalarUnits_NormalizedTwoSided;
+              m_joyX = i;
               break;
             case OHMD_ANALOG_Y:
               control_map = "/input/joystick/y";
               analog_type = VRScalarUnits_NormalizedTwoSided;
+              m_joyY = i;
               break;
             case OHMD_ANALOG_PRESS:
               control_map = "/input/joystick/click";
@@ -754,21 +811,25 @@ public:
               control_map = "/input/a/click";
               touch_map = "/input/a/touch";
               m_touchCap[i] = 0;
+              m_buttonAX = i;
               break;
             case OHMD_BUTTON_B:
               control_map = "/input/b/click";
               touch_map = "/input/b/touch";
               m_touchCap[i] = 1;
+              m_buttonBY = i;
               break;
             case OHMD_BUTTON_X:
               control_map = "/input/x/click";
               touch_map = "/input/x/touch";
               m_touchCap[i] = 0;
+              m_buttonAX = i;
               break;
             case OHMD_BUTTON_Y:
               control_map = "/input/y/click";
               touch_map = "/input/y/touch";
               m_touchCap[i] = 1;
+              m_buttonBY = i;
               break;
 
             default:
@@ -797,6 +858,19 @@ public:
           vr::VRDriverInput()->CreateHapticComponent( m_ulPropertyContainer, "/output/haptic", &m_haptic );
           if (m_grip >= 0)
             vr::VRDriverInput()->CreateBooleanComponent( m_ulPropertyContainer, "/input/grip/touch", &m_gripTouch );
+
+          if (m_trigger >= 0 && m_grip >= 0 && m_joyX >= 0 && m_joyY >= 0 && LoadHandPosesOnce()) {
+            m_left = device_idx == RIFTD_DEV_LEFT;
+            vr::VRBoneTransform_t limit[HAND_BONES];
+            HandSkeleton::GripLimit(m_left, limit);
+            EVRInputError err = vr::VRDriverInput()->CreateSkeletonComponent( m_ulPropertyContainer,
+                m_left ? "/input/skeleton/left" : "/input/skeleton/right", m_left ? "/skeleton/hand/left" : "/skeleton/hand/right",
+                "/pose/raw", VRSkeletalTracking_Partial, limit, HAND_BONES, &m_skeleton );
+            if (err != VRInputError_None) {
+              DriverLog("hand skeleton: CreateSkeletonComponent failed: %d\n", (int)err);
+              m_skeleton = k_ulInvalidInputComponentHandle;
+            }
+          }
         }
 
         return VRInitError_None;
@@ -947,6 +1021,33 @@ public:
             vr::VRDriverInput()->UpdateBooleanComponent( m_gripTouch, m_gripTouched, 0 );
           }
         }
+        if (m_skeleton != k_ulInvalidInputComponentHandle)
+          UpdateSkeleton(control_state);
+    }
+
+    void UpdateSkeleton(const float *control_state)
+    {
+        HandInput in = {};
+        in.trigger = control_state[m_trigger];
+        in.grip = control_state[m_grip];
+        in.joyX = control_state[m_joyX];
+        in.joyY = control_state[m_joyY];
+        in.aClick = m_buttonAX >= 0 && control_state[m_buttonAX] != 0;
+        in.bClick = m_buttonBY >= 0 && control_state[m_buttonBY] != 0;
+        in.aTouch = m_touched[0];
+        in.bTouch = m_touched[1];
+        in.restTouch = m_touched[2];
+        in.stickTouch = m_touched[3];
+        in.triggerTouch = m_touched[4];
+
+        int64_t now = QpcNow();
+        float dt = m_skeletonQpc ? (float)((double)(now - m_skeletonQpc) / QpcFreq()) : 0.0f;
+        m_skeletonQpc = now;
+
+        vr::VRBoneTransform_t with[HAND_BONES], without[HAND_BONES];
+        m_hand.Update(in, dt, m_left, with, without);
+        vr::VRDriverInput()->UpdateSkeletonComponent( m_skeleton, VRSkeletalMotionRange_WithController, with, HAND_BONES );
+        vr::VRDriverInput()->UpdateSkeletonComponent( m_skeleton, VRSkeletalMotionRange_WithoutController, without, HAND_BONES );
     }
 
     // The right Oculus button reaches SteamVR for one frame on release, and not after a hold that
@@ -995,7 +1096,12 @@ private:
     bool m_homeDown = false;
     int64_t m_homeSince = 0;
     int m_grip = -1;
+    int m_trigger = -1, m_joyX = -1, m_joyY = -1, m_buttonAX = -1, m_buttonBY = -1; // control indices
     bool m_touched[5] = {}; // riftd_device.touch past its threshold
+    vr::VRInputComponentHandle_t m_skeleton = k_ulInvalidInputComponentHandle;
+    HandSkeleton m_hand;
+    bool m_left = false;
+    int64_t m_skeletonQpc = 0;
     vr::VRInputComponentHandle_t m_gripTouch = k_ulInvalidInputComponentHandle;
     bool m_gripTouched = false;
     std::string m_sSerialNumber = "Controller serial number " + std::to_string(index);
