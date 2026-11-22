@@ -1080,8 +1080,14 @@ public:
             }
         }
 
-        // windowX/windowY: desktop position of the HMD panel in extended mode
+        // directMode: the compositor drives the Rift as a direct mode display (NVIDIA direct mode, or Windows'
+        // for a head-mounted display) instead of a desktop monitor, so the desktop position does not matter
         vr::EVRSettingsError serr = vr::VRSettingsError_None;
+        m_directMode = vr::VRSettings()->GetBool( k_pch_Sample_Section, "directMode", &serr );
+        if (serr != vr::VRSettingsError_None) m_directMode = false;
+
+        // windowX/windowY: desktop position of the HMD panel in extended mode
+        serr = vr::VRSettingsError_None;
         m_nWindowX = vr::VRSettings()->GetInt32( k_pch_Sample_Section, "windowX", &serr );
         if (serr != vr::VRSettingsError_None) m_nWindowX = 1920;
         serr = vr::VRSettingsError_None;
@@ -1127,7 +1133,10 @@ public:
         DriverLog( "driver_openhmd: Vendor: %s\n", m_sVendor.c_str() );
         DriverLog( "driver_openhmd: Serial Number: %s\n", m_sSerialNumber.c_str() );
         DriverLog( "driver_openhmd: Model Number: %s\n", m_sModelNumber.c_str() );
-        DriverLog( "driver_openhmd: Window: %d %d %d %d\n", m_nWindowX, m_nWindowY, m_nWindowWidth, m_nWindowHeight );
+        if (m_directMode)
+            m_nWindowX = m_nWindowY = 0;
+        DriverLog( "driver_openhmd: %s mode, window: %d %d %d %d\n", m_directMode ? "direct" : "extended", m_nWindowX, m_nWindowY,
+                   m_nWindowWidth, m_nWindowHeight );
         DriverLog( "driver_openhmd: Render Target: %d %d\n", m_nRenderWidth, m_nRenderHeight );
         DriverLog( "driver_openhmd: Seconds from Vsync to Photons: %f\n", m_flSecondsFromVsyncToPhotons );
                                                 DriverLog( "driver_openhmd: Display Frequency: %f\n", m_flDisplayFrequency );
@@ -1140,7 +1149,7 @@ public:
         // The CV1 panel only appears as a desktop display once the HMD is opened; the compositor
         // fails with InvalidOutputDesktop if it starts before Windows has attached it. A ready
         // riftd has already waited for it, so the riftd backend only checks once.
-        bool found = false;
+        bool found = m_directMode;
         int64_t waitStart = QpcNow();
         int tries;
         for (tries = 0; !found; tries++) {
@@ -1216,6 +1225,13 @@ public:
         vr::VRProperties()->SetFloatProperty( m_ulPropertyContainer, Prop_UserHeadToEyeDepthMeters_Float, 0.f );
         vr::VRProperties()->SetFloatProperty( m_ulPropertyContainer, Prop_DisplayFrequency_Float, m_flDisplayFrequency );
         vr::VRProperties()->SetFloatProperty( m_ulPropertyContainer, Prop_SecondsFromVsyncToPhotons_Float, m_flSecondsFromVsyncToPhotons );
+        vr::VRProperties()->SetBoolProperty( m_ulPropertyContainer, Prop_IsOnDesktop_Bool, !m_directMode );
+        if (m_cv1) {
+            // EDID manufacturer "OVR" and product 4, each EDID byte pair read little-endian: the form SteamVR's
+            // direct_mode edidVid/edidPid settings and the compositor's display search use
+            vr::VRProperties()->SetInt32Property( m_ulPropertyContainer, Prop_EdidVendorID_Int32, 0xD23E );
+            vr::VRProperties()->SetInt32Property( m_ulPropertyContainer, Prop_EdidProductID_Int32, 0x0004 );
+        }
 
         //float sep;
 
@@ -1302,7 +1318,7 @@ public:
 
     bool IsDisplayOnDesktop()
     {
-        return true;
+        return !m_directMode;
     }
 
     bool IsDisplayRealDisplay()
@@ -1721,6 +1737,7 @@ private:
     riftd_display m_display = {};
     bool m_hadOptical = false;
     bool m_cv1 = false;
+    bool m_directMode = false;
     bool m_oculusIdentity = false;
     vr::VRInputComponentHandle_t m_proximity = k_ulInvalidInputComponentHandle;
     vr::VRInputComponentHandle_t m_remote[RIFTD_MAX_CONTROLS] = {}; // k_ulInvalidInputComponentHandle is 0
