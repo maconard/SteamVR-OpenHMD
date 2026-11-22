@@ -1,4 +1,7 @@
 // Copyright 2026, Michael Conard.
+// Copyright 2020-2025, Collabora, Ltd. (Monado rift_driver.c)
+// Copyright 2025-2026, Beyley Cardellio (Monado rift_driver.c, u_distortion_mesh_rift.c)
+// Copyright 2026, NVIDIA CORPORATION. (Monado rift_driver.c)
 // SPDX-License-Identifier: BSL-1.0
 //
 // Rift CV1 stereo view: projection tangents, render target size and distortion per eye, from one
