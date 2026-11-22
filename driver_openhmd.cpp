@@ -1828,7 +1828,7 @@ EVRInitError CServerDriver_OpenHMD::Init( vr::IVRDriverContext *pDriverContext )
             g_snapFresh = false;
             DriverLog("driver_openhmd: riftd not ready after %d s; adding the devices it last reported, disconnected until it is ready\n", timeout);
         } else {
-            DriverLog("driver_openhmd: riftd not ready after %d s and no %s; start build\\arm64\\tracker\\riftd.exe or set driver_openhmd.backend to openhmd\n",
+            DriverLog("driver_openhmd: riftd not ready after %d s and no %s; start SteamVR with oculus-on-arm's scripts\\start-steamvr-rift.ps1, which starts riftd first, or set driver_openhmd.backend to openhmd\n",
                       timeout, RiftdCachePath().c_str());
             return VRInitError_Init_HmdNotFound;
         }
