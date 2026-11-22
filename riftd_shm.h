@@ -146,8 +146,19 @@ typedef struct riftd_haptic_request {
 	riftd_haptic_pulse hand[2];
 } riftd_haptic_request;
 
+/* SteamVR restart request, written by the driver when the compositor does not recover after the
+ * headset reconnects, polled by riftd: increment seq. riftd runs scripts\restart-steamvr.ps1 once
+ * the headset is open and its display is up, at most once a minute. */
+#define RIFTD_RESTART_NAME "Local\\riftd-restart"
+
+typedef struct riftd_restart_request {
+	volatile uint32_t seq;
+	uint32_t reserved;
+} riftd_restart_request;
+
 #define RIFTD_SHM_ASSERT(name, cond) typedef char riftd_shm_assert_##name[(cond) ? 1 : -1]
 RIFTD_SHM_ASSERT(haptic, sizeof(riftd_haptic_request) == 32);
+RIFTD_SHM_ASSERT(restart, sizeof(riftd_restart_request) == 8);
 RIFTD_SHM_ASSERT(size, sizeof(riftd_shm) == 2168);
 RIFTD_SHM_ASSERT(devices, offsetof(riftd_shm, devices) == 264);
 RIFTD_SHM_ASSERT(sensors, offsetof(riftd_shm, sensors) == 1924);

@@ -195,6 +195,21 @@ public:
 
     int64_t Freq() { return m_freq; }
 
+    // riftd outlives the restart, so it runs it (scripts\restart-steamvr.ps1)
+    bool RequestRestart()
+    {
+        HANDLE map = OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, RIFTD_RESTART_NAME);
+        if (!map)
+            return false;
+        riftd_restart_request *r = (riftd_restart_request *)MapViewOfFile(map, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(riftd_restart_request));
+        if (r) {
+            InterlockedIncrement((volatile LONG *)&r->seq);
+            UnmapViewOfFile(r);
+        }
+        CloseHandle(map);
+        return r != NULL;
+    }
+
 private:
     HANDLE m_map = NULL;
     const riftd_shm *m_shm = NULL;
@@ -907,6 +922,9 @@ public:
         if( unResponseBufferSize >= 1 )
             pchResponseBuffer[0] = 0;
     }
+
+    // riftd reopened the devices: hold the default spot again until the cameras see the controller
+    void ResetOptical() { m_hadOptical = false; }
 
     DriverPose_t GetPose()
     {
@@ -1747,6 +1765,8 @@ public:
         return coordinates;
     }
 
+    void ResetOptical() { m_hadOptical = false; }
+
     DriverPose_t GetPose()
     {
         DriverPose_t pose = { 0 };
@@ -1896,9 +1916,20 @@ public:
     virtual void LeaveStandby()  {}
 
 private:
+    void WatchReconnect();
+
     COpenHMDDeviceDriver *m_OpenHMDDeviceDriver;
     COpenHMDDeviceDriverController *m_OpenHMDDeviceDriverControllerL;
     COpenHMDDeviceDriverController *m_OpenHMDDeviceDriverControllerR;
+
+    // driver_openhmd.reconnectRestart: what to do when the compositor does not present after the headset
+    // comes back through riftd
+    enum { RESTART_AUTO, RESTART_ALWAYS, RESTART_NEVER } m_restartPolicy = RESTART_AUTO;
+    int32_t m_reconnectWait = 15;
+    bool m_hmdPresent = true;
+    int64_t m_lostAt = 0, m_watchUntil = 0, m_nextSample = 0;
+    uint32_t m_lastFrameIndex = 0;
+    int m_presenting = 0;
 };
 
 CServerDriver_OpenHMD g_serverDriverOpenHMD;
@@ -1944,6 +1975,22 @@ EVRInitError CServerDriver_OpenHMD::Init( vr::IVRDriverContext *pDriverContext )
             return VRInitError_Init_HmdNotFound;
         }
         g_riftd = true;
+
+        char policy[16] = "auto";
+        herr = vr::VRSettingsError_None;
+        vr::VRSettings()->GetString( k_pch_Sample_Section, "reconnectRestart", policy, sizeof(policy), &herr );
+        if (herr == vr::VRSettingsError_None && strcmp(policy, "always") == 0)
+            m_restartPolicy = RESTART_ALWAYS;
+        else if (herr == vr::VRSettingsError_None && strcmp(policy, "never") == 0)
+            m_restartPolicy = RESTART_NEVER;
+        else
+            strcpy(policy, "auto");
+        herr = vr::VRSettingsError_None;
+        int32_t wait = vr::VRSettings()->GetInt32( k_pch_Sample_Section, "reconnectWait", &herr );
+        if (herr == vr::VRSettingsError_None && wait >= 5 && wait <= 120)
+            m_reconnectWait = wait;
+        m_hmdPresent = (g_snap.devices[RIFTD_DEV_HMD].flags & RIFTD_DEVICE_PRESENT) != 0;
+        DriverLog("driver_openhmd: reconnectRestart %s, reconnectWait %d s\n", policy, m_reconnectWait);
 
         m_OpenHMDDeviceDriver = new COpenHMDDeviceDriver(-1, -1);
         vr::VRServerDriverHost()->TrackedDeviceAdded( m_OpenHMDDeviceDriver->GetSerialNumber().c_str(), vr::TrackedDeviceClass_HMD, m_OpenHMDDeviceDriver );
@@ -2051,6 +2098,74 @@ void CServerDriver_OpenHMD::Cleanup()
 }
 
 
+#if defined( _WINDOWS )
+// riftd clears PRESENT while the headset is gone and sets it once riftd has reopened it. NVIDIA direct mode
+// and extended mode both lose the panel while the headset is unpowered; the compositor counts as back once
+// it presents frames again (frame timings), otherwise riftd restarts SteamVR (reconnectRestart).
+void CServerDriver_OpenHMD::WatchReconnect()
+{
+    int64_t now = QpcNow(), freq = g_riftdClient.Freq();
+    AcquireSRWLockShared(&g_snapLock);
+    bool present = (g_snap.devices[RIFTD_DEV_HMD].flags & RIFTD_DEVICE_PRESENT) != 0;
+    bool stopping = g_snap.state == RIFTD_STATE_STOPPING;
+    ReleaseSRWLockShared(&g_snapLock);
+
+    if (present != m_hmdPresent) {
+        m_hmdPresent = present;
+        if (!present) {
+            m_lostAt = now;
+            m_watchUntil = 0;
+            DriverLog("driver_openhmd: headset disconnected (%s)\n", stopping ? "riftd stopping" : "riftd lost it");
+        } else {
+            DriverLog("driver_openhmd: headset reconnected after %.1f s; watching the compositor for %d s\n",
+                      m_lostAt ? (double)(now - m_lostAt) / freq : 0.0, m_reconnectWait);
+            if (m_OpenHMDDeviceDriver)
+                m_OpenHMDDeviceDriver->ResetOptical();
+            if (m_OpenHMDDeviceDriverControllerL)
+                m_OpenHMDDeviceDriverControllerL->ResetOptical();
+            if (m_OpenHMDDeviceDriverControllerR)
+                m_OpenHMDDeviceDriverControllerR->ResetOptical();
+            m_watchUntil = now + m_reconnectWait * freq;
+            // riftd waits up to 6 s (direct) or 20 s (extended) for the panel before it reports ready
+            m_nextSample = now + 3 * freq;
+            m_presenting = 0;
+        }
+    }
+    if (!m_watchUntil || now < m_nextSample)
+        return;
+    m_nextSample = now + freq / 2;
+
+    // the newest entry can be a frame still waiting for its present; judge by the one before it
+    vr::Compositor_FrameTiming t[2] = {};
+    t[0].m_nSize = sizeof(t[0]);
+    uint32_t n = vr::VRServerDriverHost()->GetFrameTimings(t, 2);
+    const vr::Compositor_FrameTiming &f = t[0];
+    bool presenting = n == 2 && f.m_nFrameIndex != m_lastFrameIndex && f.m_nNumFramePresents > 0;
+    DriverLog("driver_openhmd: reconnect check: %u timings, frame %u, presents %u, mispresented %u, dropped %u\n",
+              n, f.m_nFrameIndex, f.m_nNumFramePresents, f.m_nNumMisPresented, f.m_nNumDroppedFrames);
+    m_lastFrameIndex = f.m_nFrameIndex;
+    m_presenting = presenting ? m_presenting + 1 : 0;
+
+    if (m_restartPolicy != RESTART_ALWAYS && m_presenting >= 4) {
+        DriverLog("driver_openhmd: compositor presents again after the reconnect; no restart\n");
+        m_watchUntil = 0;
+        return;
+    }
+    if (m_restartPolicy != RESTART_ALWAYS && now < m_watchUntil)
+        return;
+    m_watchUntil = 0;
+    if (m_restartPolicy == RESTART_NEVER) {
+        DriverLog("driver_openhmd: compositor did not present within %d s of the reconnect; reconnectRestart is never, "
+                  "restart SteamVR with the stop and start scripts\n", m_reconnectWait);
+        return;
+    }
+    bool sent = g_riftdClient.RequestRestart();
+    DriverLog("driver_openhmd: %s; %s\n",
+              m_restartPolicy == RESTART_ALWAYS ? "reconnectRestart is always" : "compositor did not present after the reconnect",
+              sent ? "asked riftd to restart SteamVR" : "riftd restart request mapping not found, restart SteamVR by hand");
+}
+#endif
+
 void CServerDriver_OpenHMD::RunFrame()
 {
 #if defined( _WINDOWS )
@@ -2072,12 +2187,16 @@ void CServerDriver_OpenHMD::RunFrame()
             cached = true;
         }
         g_snapFresh = fresh;
+        WatchReconnect();
     } else
 #endif
     ohmd_ctx_update(ctx);
 
     vr::VREvent_t ev;
     while (vr::VRServerDriverHost()->PollNextEvent(&ev, sizeof(ev))) {
+        if (ev.eventType == vr::VREvent_Compositor_DisplayDisconnected || ev.eventType == vr::VREvent_Compositor_DisplayReconnected)
+            DriverLog("driver_openhmd: compositor reports its display %s\n",
+                      ev.eventType == vr::VREvent_Compositor_DisplayDisconnected ? "disconnected" : "reconnected");
         if (ev.eventType != vr::VREvent_Input_HapticVibration)
             continue;
 #if defined( _WINDOWS )
