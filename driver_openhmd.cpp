@@ -784,15 +784,16 @@ public:
               vr::VRDriverInput()->CreateScalarComponent( m_ulPropertyContainer, control_map, m_analogControls + i, VRScalarType_Absolute, analog_type);
             }
           }
+	  // touch_profile.json declares every touch as a boolean
 	  if (touch_map != NULL) {
-              vr::VRDriverInput()->CreateScalarComponent( m_ulPropertyContainer, touch_map, m_touchControls + i, VRScalarType_Absolute, analog_type);
+              vr::VRDriverInput()->CreateBooleanComponent( m_ulPropertyContainer, touch_map, m_touchControls + i);
           }
         }
 
         if (g_riftd && m_is_oculus) {
           const char *extra[3] = { "/input/thumbrest/touch", "/input/joystick/touch", "/input/trigger/touch" };
           for (int k = 0; k < 3; k++)
-            vr::VRDriverInput()->CreateScalarComponent( m_ulPropertyContainer, extra[k], m_extraTouch + k, VRScalarType_Absolute, VRScalarUnits_NormalizedOneSided);
+            vr::VRDriverInput()->CreateBooleanComponent( m_ulPropertyContainer, extra[k], m_extraTouch + k);
           vr::VRDriverInput()->CreateHapticComponent( m_ulPropertyContainer, "/output/haptic", &m_haptic );
           if (m_grip >= 0)
             vr::VRDriverInput()->CreateBooleanComponent( m_ulPropertyContainer, "/input/grip/touch", &m_gripTouch );
@@ -915,6 +916,9 @@ public:
             control_count = RIFTD_MAX_CONTROLS;
           memcpy(control_state, snap.controls, control_count * sizeof(float));
           memcpy(touch_state, snap.touch, sizeof(touch_state));
+          // riftd scales each capacitive sensor so that 1 is its calibrated touch level
+          for (int k = 0; k < 5; k++)
+            m_touched[k] = m_touched[k] ? touch_state[k] > 0.5f : touch_state[k] > 0.75f;
         } else
           ohmd_device_getf(device, OHMD_CONTROLS_STATE, control_state);
 
@@ -928,14 +932,14 @@ public:
           else if (m_analogControls[i] != k_ulInvalidInputComponentHandle)
             vr::VRDriverInput()->UpdateScalarComponent( m_analogControls[i], control_state[i], 0 );
           if (m_touchControls[i] != k_ulInvalidInputComponentHandle) {
-            float touched = (g_riftd && m_touchCap[i] >= 0) ? touch_state[m_touchCap[i]] : (control_state[i] == 0 ? 0.0f : 1.0f);
-            vr::VRDriverInput()->UpdateScalarComponent( m_touchControls[i], touched, 0 );
+            bool touched = (g_riftd && m_touchCap[i] >= 0) ? m_touched[m_touchCap[i]] : control_state[i] != 0;
+            vr::VRDriverInput()->UpdateBooleanComponent( m_touchControls[i], touched, 0 );
           }
         }
         if (g_riftd) {
           for (int k = 0; k < 3; k++)
             if (m_extraTouch[k] != k_ulInvalidInputComponentHandle)
-              vr::VRDriverInput()->UpdateScalarComponent( m_extraTouch[k], touch_state[2 + k], 0 );
+              vr::VRDriverInput()->UpdateBooleanComponent( m_extraTouch[k], m_touched[2 + k], 0 );
           // the grip has no capacitive sensor
           if (m_gripTouch != k_ulInvalidInputComponentHandle) {
             float g = control_state[m_grip];
@@ -991,6 +995,7 @@ private:
     bool m_homeDown = false;
     int64_t m_homeSince = 0;
     int m_grip = -1;
+    bool m_touched[5] = {}; // riftd_device.touch past its threshold
     vr::VRInputComponentHandle_t m_gripTouch = k_ulInvalidInputComponentHandle;
     bool m_gripTouched = false;
     std::string m_sSerialNumber = "Controller serial number " + std::to_string(index);
